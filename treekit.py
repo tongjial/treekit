@@ -202,6 +202,8 @@ Use treekit <command> -h for help with arguments of the command of interest
 class FuncTree:
     """Class for encapsulate treekit functions"""
 
+    # code loading at the initialization phase
+
     def __init__(self, **kwargs):
 
         # set defaults and get values from kwargs
@@ -307,7 +309,7 @@ class FuncTree:
         else:
             return cores
 
-    """code loading at the initialization phase"""
+    # code for Meta Functions on a tree object
 
     def is_binary(self, tree_object):
 
@@ -387,7 +389,7 @@ class FuncTree:
         else:
             return None
 
-    """code for Meta Functions on a tree object"""
+    # methods corresponding to summary block
     
     def get_summaries(self):
         
@@ -652,7 +654,7 @@ class FuncTree:
             else:
                 print(header_out + '\n' + '\n'.join(summ_out))
 
-    """methods corresponding to summary block"""
+    # methods corresponding to taxa code block
 
     def get_taxa_list(self):
         
@@ -715,7 +717,7 @@ class FuncTree:
         else:
             print('\n'.join(taxa_out))
 
-    """methods corresponding to taxa code block"""
+    # methods corresponding to remove code block
 
     def get_reduced_trees(self):
         
@@ -760,7 +762,7 @@ class FuncTree:
         else:
             print(tree_out)
 
-    """methods corresponding to remove code block"""
+    # general methods for all common blocks
 
     def file_overwrite_warning(self):
 
@@ -768,15 +770,14 @@ class FuncTree:
         if self.out_file.exists():
             print("WARNING: You are overwriting '" + str(self.out_file) + "'")
 
-    """general methods for all common blocks"""
+# general functions for global invoking
 
 def decimal_correct(m, n=9):
     
     # keep n decimal places behind the point for input float m
     return int(float(m) * (10 ** n)) / (10 ** n)
 
-""" general functions for global invoking"""
-
+# main function
 
 def main():
     

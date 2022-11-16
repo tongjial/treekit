@@ -1,2 +1,2 @@
-# treekit
- A toolkit for the tree manipulation
+# TreeKit
+ A toolkit for the mass trees manipulation

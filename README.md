@@ -6,7 +6,11 @@ A toolkit for the mass trees manipulation
 * [DendroPy](https://dendropy.org/)
 
 ## Installation
-You can download this repository zipped and use treekit.py in the mian directory as a stand-alone program or clone it if you have git installed on your system
+You can use treekit.py as a stand-alone program 
+or clone it if you have git installed on your system
+```
+git clone https://github.com/tongjial/treekit.git
+```
 
 ## Current implementation
 usage:

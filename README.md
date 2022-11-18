@@ -2,7 +2,11 @@
 A toolkit for the mass trees manipulation
 
 ## Dependency
+* [python3](https://www.python.org/downloads/)
 * [DendroPy](https://dendropy.org/)
+
+## Installation
+You can download this repository zipped and use treekit.py in the mian directory as a stand-alone program or clone it if you have git installed on your system
 
 ## Current implementation
 usage:

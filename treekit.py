@@ -785,7 +785,7 @@ def main():
     kwargs = configs()
     func_tree = FuncTree(**kwargs)
 
-    # run FuncTree methods to get outputs   
+    # run FuncTree methods to get outputs 
     if func_tree.command == "summary":
         func_tree.write_summaries()
 

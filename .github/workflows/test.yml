@@ -1,0 +1,24 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      # uv installs standalone Python builds, so versions that the runner image
+      # no longer ships (such as 3.9 on recent Ubuntu) can still be tested
+      - uses: astral-sh/setup-uv@v6
+      - name: Install
+        run: |
+          uv venv --python ${{ matrix.python-version }}
+          uv pip install ".[test]"
+      - name: Test
+        run: .venv/bin/pytest -q

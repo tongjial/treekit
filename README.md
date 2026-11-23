@@ -30,7 +30,7 @@ The options of commands are:
     taxa        view taxa summary
     remove      remove specific taxa/tips from trees
     keep        pick-up the trees with specific taxa
-    mrca        (planned) check the monophyly or extract the clade based on given taxa/group
+    mrca        check the monophyly or extract the clade based on given taxa/group
     extract     generate subtrees only consist of the given taxa
     prune       (planned) prune trees with specific branchlength
     root        root/reroot/unroot trees
@@ -107,6 +107,28 @@ A tree that cannot be rooted (no outgroup taxon, an outgroup that is not monophy
 lengths for `--midpoint`) is written unchanged, so the output has the same trees in the same order
 as the input; one warning per reason lists the trees. `--strict` makes this an error.
 Node labels such as branch supports stay on their branch when the root moves.
+
+### mrca
+`treekit mrca -n A B C -i trees.tre` tests whether the group A, B, C is monophyletic in every
+tree; `-g groups.tsv` tests several groups at once (one `taxon<TAB>group` per line, `#` starts a
+comment). The table has one row per tree and group:
+
+| column | meaning |
+|---|---|
+| `source`, `index` | input file and tree number in that file |
+| `rooted` | whether the rooted rule was used (the tree has a bifurcating root) |
+| `members_present`, `members_total` | group members in this tree, and in the group |
+| `monophyletic` | `True`/`False`; `NA` if fewer than two members are present, or no other tip |
+| `num_intruders`, `intruders` | for rooted trees, the other tips inside the clade of the group's MRCA |
+
+* Rooted trees: the group is monophyletic if the clade of its most recent common ancestor holds
+  only group members. Unrooted trees: if one branch separates the group from all other tips,
+  wherever the root is placed. `--unrooted` applies the unrooted rule to every tree.
+* Groups are tested on the members present in each tree; the log has the count per group.
+* `--extract` writes, instead of the table, the clade of every group in every tree (for rooted
+  trees the MRCA clade, intruders included). In nexus output (`-u nexus`) each clade is named
+  `<group>_tree<number>`. Clades that cannot be extracted are skipped with a warning
+  (an error with `--strict`).
 
 ## Examples
 Sample data is in `examples/`:

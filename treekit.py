@@ -15,7 +15,7 @@ COMMANDS = (
     ("taxa", "view taxa summary", "write_taxa_out"),
     ("remove", "remove specific taxa/tips from trees", "write_reduced_trees"),
     ("keep", "pick-up the trees with specific taxa", "write_kept_trees"),
-    ("mrca", "check the monophyly or extract the clade based on given taxa/group", None),
+    ("mrca", "check the monophyly or extract the clade based on given taxa/group", "write_mrca"),
     ("extract", "generate subtrees only consist of the given taxa", "write_extracted_trees"),
     ("prune", "prune trees with specific branchlength", None),
     ("root", "root/reroot/unroot trees", "write_rooted_trees"),
@@ -293,6 +293,35 @@ class ParsedArgs:
         self.add_strict_arg(
             parser, "Exit with an error if a tree cannot be rooted, or if an outgroup "
                     "taxon is absent from all trees.")
+
+    def mrca(self, parser):
+
+        # one group (-n/-f) or several groups from a table (-g)
+        group = parser.add_mutually_exclusive_group(required=True)
+        self.add_taxa_args(parser, "of one group", group=group)
+        group.add_argument(
+            "-g",
+            "--groups-file",
+            dest = "groups_file",
+            type = str,
+            help = "Tab-separated file of 'taxon<TAB>group' lines, to check several groups."
+        )
+        parser.add_argument(
+            "--extract",
+            dest = "extract_clades",
+            action = "store_true",
+            help = "Write the clade of every group instead of the monophyly table."
+        )
+        parser.add_argument(
+            "--unrooted",
+            dest = "force_unrooted",
+            action = "store_true",
+            help = "Treat every tree as unrooted, even when its root is bifurcating."
+        )
+        self.add_tree_out_args(parser)
+        self.add_strict_arg(
+            parser, "Exit with an error if a group taxon is absent from all trees, or if a "
+                    "clade cannot be extracted.")
 
     def get_args_dict(self):
 
@@ -952,6 +981,134 @@ class FuncTree:
 
         self.write_trees(self.get_rooted_trees())
 
+    # methods corresponding to mrca code block
+
+    def get_groups(self):
+
+        # {group name: [taxa]} in the order of the input
+        groups_file = self.options.get("groups_file")
+        if not groups_file:
+            return {"group": self.get_requested_taxa("of the group")}
+
+        path = self.get_path(groups_file)
+        if not path.is_file():
+            raise TreekitError("groups file not found: '%s'" % path)
+        groups = {}
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                for number, line in enumerate(handle, start=1):
+                    line = line.rstrip("\r\n")
+                    if not line.strip() or line.lstrip().startswith("#"):
+                        continue
+                    fields = line.split("\t")
+                    if len(fields) != 2 or not fields[0].strip() or not fields[1].strip():
+                        raise TreekitError(
+                            "line %d of '%s' is not 'taxon<TAB>group': %r" % (number, path, line))
+                    taxon, name = fields[0].strip(), fields[1].strip()
+                    members = groups.setdefault(name, [])
+                    if taxon not in members:
+                        members.append(taxon)
+        except UnicodeDecodeError:
+            raise TreekitError("'%s' is not valid UTF-8 text" % path)
+        if not groups:
+            raise TreekitError("no groups in '%s'" % path)
+        return groups
+
+    def read_all_trees_with_sources(self):
+
+        # like read_all_trees, with the file name and index of every tree
+        tree_list = new_tree_list()
+        sources = []
+        for in_file, in_format in zip(self.in_files, self.in_formats):
+            file_trees = self.read_trees(in_file, in_format, preserve_underscores = True)
+            for index, tree in enumerate(file_trees, start=1):
+                tree_list.append(tree)
+                sources.append((in_file.name, index))
+        return tree_list, sources
+
+    def get_mrca_results(self):
+
+        # test every group in every tree
+        tree_list, sources = self.read_all_trees_with_sources()
+        groups = self.get_groups()
+        force_unrooted = bool(self.options.get("force_unrooted"))
+
+        # tips without a label cannot be told apart from group members
+        for number, tree in enumerate(tree_list, start=1):
+            if any(leaf.taxon is None for leaf in tree.leaf_node_iter()):
+                raise TreekitError(
+                    "tree %d has a tip without a label; monophyly cannot be tested" % number)
+
+        all_taxa = list(dict.fromkeys(t for members in groups.values() for t in members))
+        found = Counter()
+        for tree in tree_list:
+            found.update(set(all_taxa) & self.tip_labels(tree))
+        self.report_taxa_presence(all_taxa, found, len(tree_list), "of the groups", "found in")
+
+        results = []
+        for number, (tree, source) in enumerate(zip(tree_list, sources), start=1):
+            for name, members in groups.items():
+                results.append((number, tree, source, name, len(members),
+                                group_monophyly(tree, members, force_unrooted)))
+        return tree_list, results
+
+    def write_mrca(self):
+
+        tree_list, results = self.get_mrca_results()
+        if self.options.get("extract_clades"):
+            self.write_mrca_clades(tree_list, results)
+            return
+
+        header = ["source", "index", "group", "rooted", "members_present", "members_total",
+                  "monophyletic", "num_intruders", "intruders"]
+        rows = []
+        tested = Counter()
+        monophyletic = Counter()
+        for number, tree, source, name, total, status in results:
+            mono = status["monophyletic"]
+            intruders = status["intruders"]
+            rows.append((
+                source[0], source[1], name, status["rooted"], status["present"], total,
+                "NA" if mono is None else mono,
+                "NA" if intruders is None else len(intruders),
+                "NA" if intruders is None else ",".join(intruders),
+            ))
+            if mono is not None:
+                tested[name] += 1
+                monophyletic[name] += int(mono)
+        for name in dict.fromkeys(r[3] for r in results):
+            log.info("group '%s': monophyletic in %d of %d testable trees"
+                     % (name, monophyletic[name], tested[name]))
+
+        lines = ["\t".join(header)] + ["\t".join(str(v) for v in row) for row in rows]
+        self.emit("\n".join(lines), "monophyly table")
+
+    def write_mrca_clades(self, tree_list, results):
+
+        # one clade per tree and group; a group that is not a clade is skipped
+        clades = new_tree_list(tree_list.taxon_namespace)
+        skipped = {}
+        for number, tree, source, name, total, status in results:
+            clade = extract_group_clade(tree, status)
+            if isinstance(clade, str):
+                skipped.setdefault(clade, []).append("%d/%s" % (number, name))
+                continue
+            clade.label = "%s_tree%d" % (name, number)
+            clades.append(clade)
+            log.info("extracted the clade of group '%s' from tree %d (%s, tree %d)"
+                     % (name, number, source[0], source[1]))
+
+        for reason, items in skipped.items():
+            message = "%d clade(s) cannot be extracted (%s): tree/group %s" % (
+                len(items), reason, format_numbers(items))
+            if self.strict:
+                raise TreekitError(message + " (--strict)")
+            log.warning(message + "; skipped")
+        if len(clades) == 0:
+            raise TreekitError("no clade could be extracted")
+        self.drop_unused_taxa(clades)
+        self.write_trees(clades)
+
     # general methods for commands that write trees
 
     def drop_unused_taxa(self, tree_list):
@@ -1180,6 +1337,85 @@ def root_at_midpoint(tree):
         distance_from_tail = distance[far] - half
     root_on_edge(tree, edge, min(max(distance_from_tail, 0.0), float(edge.length)))
     return None
+
+def group_monophyly(tree, members, force_unrooted=False):
+
+    # rooted trees: the group is monophyletic if the clade of its MRCA holds only
+    # group members. Unrooted trees: if one branch separates the group from all
+    # other tips, wherever the root is. Groups are tested on the members present.
+    wanted = set(members)
+    n_all = 0
+    in_group = {}
+    tips_below = {}
+    for node in tree.postorder_node_iter():
+        if node.is_leaf():
+            n_all += 1
+            in_group[node] = int(node.taxon.label in wanted)
+            tips_below[node] = 1
+        else:
+            in_group[node] = sum(in_group[c] for c in node.child_node_iter())
+            tips_below[node] = sum(tips_below[c] for c in node.child_node_iter())
+    present = in_group[tree.seed_node]
+    rooted = not force_unrooted and len(tree.seed_node.child_nodes()) == 2
+    status = {"rooted": rooted, "present": present, "monophyletic": None,
+              "intruders": None, "node": None, "side": None}
+
+    # one member, or no tip outside the group: nothing to test
+    if present < 2 or present == n_all:
+        return status
+
+    if rooted:
+        # the first node in postorder that holds every member is their MRCA
+        for node in tree.postorder_node_iter():
+            if in_group[node] == present:
+                break
+        intruders = sorted(leaf.taxon.label for leaf in node.leaf_iter()
+                           if leaf.taxon.label not in wanted)
+        status.update(monophyletic=not intruders, intruders=intruders, node=node)
+        return status
+
+    for node in tree.postorder_node_iter():
+        if node is tree.seed_node:
+            continue
+        if in_group[node] == present == tips_below[node]:
+            status.update(monophyletic=True, intruders=[], node=node, side="below")
+            return status
+        if in_group[node] == 0 and tips_below[node] == n_all - present:
+            status.update(monophyletic=True, intruders=[], node=node, side="above")
+            return status
+    status.update(monophyletic=False)
+    return status
+
+def extract_group_clade(tree, status):
+
+    # the clade of a group as a new tree, or the reason why there is none
+    if status["monophyletic"] is None:
+        return "fewer than 2 group members, or no other tip, in the tree"
+    if status["rooted"]:
+        labels = [leaf.taxon.label for leaf in status["node"].leaf_iter()]
+    elif not status["monophyletic"]:
+        return "the group is not monophyletic in an unrooted tree"
+    elif status["side"] == "below":
+        labels = [leaf.taxon.label for leaf in status["node"].leaf_iter()]
+    else:
+        # the group is the rest of the tree above this node: on a copy, root on the
+        # node's branch so that the group becomes one side of the root
+        below = set(leaf.taxon.label for leaf in status["node"].leaf_iter())
+        copy = tree.clone(depth=1)
+        for node in copy.postorder_node_iter():
+            if node is not copy.seed_node and \
+                    set(leaf.taxon.label for leaf in node.leaf_iter()) == below:
+                break
+        length = node.edge.length
+        root_on_edge(copy, node.edge, None if length is None else float(length) / 2)
+        group_side = [child for child in copy.seed_node.child_nodes()
+                      if not below & set(leaf.taxon.label for leaf in child.leaf_iter())][0]
+        tree = copy
+        labels = [leaf.taxon.label for leaf in group_side.leaf_iter()]
+    clade = tree.extract_tree_with_taxa_labels(labels)
+    clade.seed_node.edge.length = None
+    clade.is_rooted = True
+    return clade
 
 def format_numbers(numbers, limit=20):
 

@@ -35,7 +35,7 @@ The options of commands are:
     prune       (planned) prune trees with specific branchlength
     root        root/reroot/unroot trees
     draw        display trees as textplot
-    compare     (planned) compare trees between two different sources
+    compare     compare trees between two different sources
 Use treekit <command> -h for help with arguments of the command of interest
 ```
 
@@ -44,7 +44,7 @@ Use treekit <command> -h for help with arguments of the command of interest
 |---|---|
 | `-i FILE [FILE ...]` | input tree files (required) |
 | `-o FILE` | write the result to this file instead of stdout; it must not be an input file |
-| `-c N` | use up to N processes, one per input file (default 1) |
+| `-c N` | use up to N processes, one per input file, for `summary` and `compare` (default 1) |
 | `-l FILE` | append run details and warnings to this log file |
 
 Results go to stdout; warnings and errors go to stderr, so the output can be piped safely.
@@ -137,6 +137,25 @@ and index in the file. `-t 3 7` draws only trees 3 and 7 (numbers count over all
 `-m length` scales the branches, `-m topology` ignores their lengths; the default `auto`
 scales them unless lengths are missing or so uneven that most branches would be shorter than
 one character (noted in the log).
+
+### compare
+`treekit compare -i a.tre -r b.tre` compares every tree of `-i` with every tree of `-r`
+(both accept several files) and writes one row per pair:
+
+| column | meaning |
+|---|---|
+| `source_a`, `index_a`, `source_b`, `index_b` | the two trees |
+| `common_taxa`, `only_a`, `only_b` | taxa in both trees, and in only one of them |
+| `rf` | Robinson-Foulds distance: branches (splits) found in only one of the two trees |
+| `norm_rf` | `rf` divided by the number of branches of both trees (0 = same, 1 = no branch shared) |
+| `weighted_rf` | sum of the branch length differences over all branches; `NA` without branch lengths |
+
+* Trees with different taxa are both reduced to their common taxa before the comparison.
+  Pairs with fewer than 4 common taxa (3 with `--rooted`) have no testable branch: `rf` is 0
+  and `norm_rf` is `NA`, with a warning.
+* Trees are compared as unrooted trees by default; `--rooted` compares clades instead.
+* The number of rows is the product of the two tree counts (846 x 846 trees: about 0.7 million
+  rows in about 30 s).
 
 ## Examples
 Sample data is in `examples/`:

@@ -20,7 +20,7 @@ COMMANDS = (
     ("prune", "prune trees with specific branchlength", None),
     ("root", "root/reroot/unroot trees", "write_rooted_trees"),
     ("draw", "display trees as textplot", "write_drawings"),
-    ("compare", "compare trees between two different sources", None),
+    ("compare", "compare trees between two different sources", "write_comparison"),
 )
 COMMAND_RUNNERS = {name: method for name, _, method in COMMANDS if method}
 IMPLEMENTED_COMMANDS = tuple(name for name, _, method in COMMANDS if method)
@@ -358,6 +358,25 @@ class ParsedArgs:
             help = "Show internal node labels, such as branch supports."
         )
 
+    def compare(self, parser):
+
+        parser.add_argument(
+            "-r",
+            "--ref-files",
+            nargs = "+",
+            dest = "ref_files",
+            type = str,
+            required = True,
+            help = "Tree files of the second source; every input tree is compared with "
+                   "every tree of these files."
+        )
+        parser.add_argument(
+            "--rooted",
+            dest = "compare_rooted",
+            action = "store_true",
+            help = "Compare the trees as rooted trees (clades) instead of unrooted (splits)."
+        )
+
     def get_args_dict(self):
 
         # store arguments in a dictionary
@@ -396,8 +415,12 @@ class FuncTree:
         cores = kwargs.get("cores")
         self.cores = 1 if cores is None else self.get_cores(cores)
 
+        # the second source of compare
+        self.ref_files = self.get_paths(kwargs.get("ref_files") or [])
+        self.ref_formats = [self.detect_format(path) for path in self.ref_files]
+
         # never write the output over one of the input files
-        if self.out_file is not None and self.out_file in self.in_files:
+        if self.out_file is not None and self.out_file in self.in_files + self.ref_files:
             raise TreekitError(
                 "-o file '%s' is also an input file; choose a different file"
                 % self.out_file
@@ -513,10 +536,12 @@ class FuncTree:
             return real_cores
         return cores
 
-    def map_files(self, function):
+    def map_files(self, function, files=None, formats=None):
 
         # apply function(in_file, in_format) to every input file, one process per file
-        jobs = list(zip(self.in_files, self.in_formats))
+        if files is None:
+            files, formats = self.in_files, self.in_formats
+        jobs = list(zip(files, formats))
 
         # a single file is handled in-process (no pool, no overhead)
         if self.cores > 1 and len(jobs) > 1:
@@ -1179,6 +1204,106 @@ class FuncTree:
                      % format_numbers(topology_only))
         self.emit("\n\n".join(drawings), "drawings")
 
+    # methods corresponding to compare code block
+
+    def get_file_shapes(self, in_file, in_format):
+
+        # a compact description of every tree of a file, cheap to send between
+        # processes: tip labels and, per node in preorder, the parent and the length
+        shapes = []
+        for number, tree in enumerate(self.read_trees(in_file, in_format,
+                                                      preserve_underscores=True), start=1):
+            nodes = list(tree.preorder_node_iter())
+            position = {node: i for i, node in enumerate(nodes)}
+            parents = []
+            lengths = []
+            labels = []
+            for node in nodes:
+                parents.append(-1 if node is tree.seed_node else position[node.parent_node])
+                lengths.append(None if node is tree.seed_node or node.edge.length is None
+                               else float(node.edge.length))
+                if node.is_leaf():
+                    if node.taxon is None:
+                        raise TreekitError(
+                            "tree %d of '%s' has a tip without a label; trees with unlabelled "
+                            "tips cannot be compared" % (number, in_file))
+                    labels.append(node.taxon.label)
+                else:
+                    labels.append(None)
+            rooted = sum(1 for p in parents if p == 0) == 2
+            shapes.append((in_file.name, number, parents, lengths, labels, rooted))
+        if not shapes:
+            raise TreekitError("no trees found in '%s'" % in_file)
+        return shapes
+
+    def get_comparison(self):
+
+        rooted_mode = bool(self.options.get("compare_rooted"))
+        shapes_a = [s for f in self.map_files(self.get_file_shapes) for s in f]
+        shapes_b = [s for f in self.map_files(self.get_file_shapes, self.ref_files,
+                                              self.ref_formats) for s in f]
+
+        # one bit per taxon over both sources
+        bit = {}
+        for shape in shapes_a + shapes_b:
+            for label in shape[4]:
+                if label is not None and label not in bit:
+                    bit[label] = 1 << len(bit)
+        label_of = {b: label for label, b in bit.items()}
+        trees_a = [TreeSplits(shape, bit) for shape in shapes_a]
+        trees_b = [TreeSplits(shape, bit) for shape in shapes_b]
+
+        if rooted_mode:
+            unrooted = [t.name for t in trees_a + trees_b if not t.rooted]
+            if unrooted:
+                log.warning("--rooted: %d tree(s) have no bifurcating root and are compared "
+                            "as written: %s" % (len(unrooted), format_numbers(unrooted)))
+
+        header = ["source_a", "index_a", "source_b", "index_b", "common_taxa",
+                  "only_a", "only_b", "rf", "norm_rf", "weighted_rf"]
+        rows = []
+        too_small = 0
+        pruned = 0
+        min_taxa = 3 if rooted_mode else 4
+        for a in trees_a:
+            for b in trees_b:
+                common = a.taxa & b.taxa
+                n_common = popcount(common)
+                only_a = popcount(a.taxa & ~common)
+                only_b = popcount(b.taxa & ~common)
+                pruned += bool(only_a or only_b)
+                if n_common < min_taxa:
+                    too_small += 1
+                    rows.append((a.source, a.index, b.source, b.index, n_common,
+                                 only_a, only_b, 0, "NA", "NA"))
+                    continue
+                splits_a, weights_a = a.restricted(common, rooted_mode)
+                splits_b, weights_b = b.restricted(common, rooted_mode)
+                rf = len(splits_a ^ splits_b)
+                denominator = len(splits_a) + len(splits_b)
+                norm = decimal_correct(rf / denominator) if denominator else "NA"
+                if a.has_lengths and b.has_lengths:
+                    weighted = decimal_correct(sum(
+                        abs(weights_a.get(key, 0.0) - weights_b.get(key, 0.0))
+                        for key in set(weights_a) | set(weights_b)))
+                else:
+                    weighted = "NA"
+                rows.append((a.source, a.index, b.source, b.index, n_common,
+                             only_a, only_b, rf, norm, weighted))
+
+        if too_small:
+            log.warning("%d pair(s) share fewer than %d taxa: rf is 0 and norm_rf is NA"
+                        % (too_small, min_taxa))
+        log.info("compared %d x %d trees (%s); %d pair(s) compared on their common taxa only"
+                 % (len(trees_a), len(trees_b), "rooted" if rooted_mode else "unrooted", pruned))
+        return header, rows
+
+    def write_comparison(self):
+
+        header, rows = self.get_comparison()
+        lines = ["\t".join(header)] + ["\t".join(str(v) for v in row) for row in rows]
+        self.emit("\n".join(lines), "comparison")
+
     # general methods for commands that write trees
 
     def drop_unused_taxa(self, tree_list):
@@ -1533,6 +1658,54 @@ def draw_tree(tree, width, metric="auto", show_supports=False):
         lines.pop()
     return "\n".join(lines), metric
 
+def popcount(value):
+
+    return bin(value).count("1")
+
+class TreeSplits:
+    """The branches of one tree as bit masks of the tips below them."""
+
+    def __init__(self, shape, bit):
+        self.source, self.index, parents, lengths, labels, self.rooted = shape
+        self.name = "%s/%d" % (self.source, self.index)
+        masks = [0] * len(parents)
+        for i in range(len(parents) - 1, -1, -1):     # children come after parents
+            if labels[i] is not None:
+                masks[i] |= bit[labels[i]]
+            if parents[i] >= 0:
+                masks[parents[i]] |= masks[i]
+        self.taxa = masks[0]
+        self.edges = [(masks[i], lengths[i]) for i in range(1, len(parents))]
+        self.has_lengths = any(length for _, length in self.edges)
+        self._cache = {}
+
+    def restricted(self, taxa, rooted):
+
+        # the branches of the tree reduced to `taxa`: the non-trivial ones as a set
+        # (for the RF distance) and all of them with summed lengths (weighted RF).
+        # Reducing a tree to a subset of tips keeps exactly the branches whose tip
+        # sets still split that subset, and branches that become one add up.
+        key = (taxa, rooted)
+        if key in self._cache:
+            return self._cache[key]
+        lowest = taxa & -taxa
+        n_taxa = popcount(taxa)
+        weights = {}
+        for mask, length in self.edges:
+            side = mask & taxa
+            if side == 0 or side == taxa:
+                continue
+            if not rooted and side & lowest:
+                side = taxa ^ side        # a split and its complement are one split
+            weights[side] = weights.get(side, 0.0) + (length or 0.0)
+        if rooted:
+            nontrivial = frozenset(s for s in weights if popcount(s) >= 2)
+        else:
+            nontrivial = frozenset(s for s in weights
+                                   if 2 <= popcount(s) <= n_taxa - 2)
+        self._cache[key] = (nontrivial, weights)
+        return nontrivial, weights
+
 def format_numbers(numbers, limit=20):
 
     # "1, 4, 7" for a short list; the first `limit` numbers and "..." otherwise
@@ -1551,7 +1724,8 @@ def main():
     try:
         # initialize parsed arguments and FuncTree objects
         kwargs = configs()
-        setup_logging(kwargs.get("log_file"), kwargs.get("in_files"))
+        setup_logging(kwargs.get("log_file"),
+                      list(kwargs.get("in_files") or []) + list(kwargs.get("ref_files") or []))
         log.info("run: treekit " + " ".join(sys.argv[1:]))
         func_tree = FuncTree(**kwargs)
 

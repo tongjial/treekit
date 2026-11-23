@@ -17,10 +17,11 @@ COMMANDS = (
     ("keep", "pick-up the trees with specific taxa", "write_kept_trees"),
     ("mrca", "check the monophyly or extract the clade based on given taxa/group", "write_mrca"),
     ("extract", "generate subtrees only consist of the given taxa", "write_extracted_trees"),
-    ("prune", "prune trees with specific branchlength", None),
+    ("prune", "prune trees with specific branchlength", "write_pruned_trees"),
     ("root", "root/reroot/unroot trees", "write_rooted_trees"),
     ("draw", "display trees as textplot", "write_drawings"),
     ("compare", "compare trees between two different sources", "write_comparison"),
+    ("collapse", "collapse branches with low support into polytomies", "write_collapsed_trees"),
 )
 COMMAND_RUNNERS = {name: method for name, _, method in COMMANDS if method}
 IMPLEMENTED_COMMANDS = tuple(name for name, _, method in COMMANDS if method)
@@ -94,6 +95,27 @@ def setup_logging(log_file=None, in_files=()):
             logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
         log.addHandler(file_handler)
     return log
+
+def positive_float(value):
+
+    # argparse type for thresholds: a number > 0
+    try:
+        number = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("invalid number: '%s'" % value)
+    if not number > 0 or math.isinf(number):
+        raise argparse.ArgumentTypeError("must be a number > 0, got '%s'" % value)
+    return number
+
+def non_negative_float(value):
+
+    try:
+        number = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("invalid number: '%s'" % value)
+    if not number >= 0 or math.isinf(number):
+        raise argparse.ArgumentTypeError("must be a number >= 0, got '%s'" % value)
+    return number
 
 def positive_int(value):
 
@@ -376,6 +398,53 @@ class ParsedArgs:
             action = "store_true",
             help = "Compare the trees as rooted trees (clades) instead of unrooted (splits)."
         )
+
+    def prune(self, parser):
+
+        parser.add_argument(
+            "--max-length",
+            dest = "max_length",
+            type = positive_float,
+            help = "Remove the tips whose branch is longer than this length."
+        )
+        parser.add_argument(
+            "--max-ratio",
+            dest = "max_ratio",
+            type = positive_float,
+            help = "Remove the tips whose branch is longer than this many times the median "
+                   "branch length of their tree."
+        )
+        self.add_tree_out_args(parser)
+        self.add_strict_arg(
+            parser, "Exit with an error if a tree cannot be pruned (no branch lengths).")
+
+    def collapse(self, parser):
+
+        parser.add_argument(
+            "-m",
+            "--min-support",
+            dest = "min_support",
+            type = non_negative_float,
+            required = True,
+            help = "Collapse the internal branches whose support is lower than this value."
+        )
+        source = parser.add_mutually_exclusive_group()
+        source.add_argument(
+            "--support-key",
+            dest = "support_key",
+            type = str,
+            help = "Read the support from this annotation, e.g. posterior for "
+                   "[&posterior=0.98] (BEAST, MrBayes). Default: the node label."
+        )
+        source.add_argument(
+            "--support-field",
+            dest = "support_field",
+            type = positive_int,
+            help = "For node labels like 80.5/97, use this '/'-separated field (1 = first)."
+        )
+        self.add_tree_out_args(parser)
+        self.add_strict_arg(
+            parser, "Exit with an error if a tree has no support value that can be read.")
 
     def get_args_dict(self):
 
@@ -733,7 +802,7 @@ class FuncTree:
 
     # methods corresponding to taxa code block
 
-    def read_all_trees(self):
+    def read_all_trees(self, **kwargs):
 
         # every file is parsed on its own, because a NEXUS file declares the number
         # of its taxa and cannot be read into a namespace already filled by another
@@ -743,7 +812,8 @@ class FuncTree:
             file_trees = self.read_trees(
                 in_file,
                 in_format,
-                preserve_underscores = True
+                preserve_underscores = True,
+                **kwargs
             )
             for tree in file_trees:
                 tree_list.append(tree)
@@ -821,6 +891,7 @@ class FuncTree:
         # prune the taxa based on labels
         for tree in tree_list:
             tree.prune_taxa_with_labels(taxa_to_remove)
+            clear_stem(tree)
 
         # no tree uses the removed taxa any more, so do not declare them in the output
         taxon_namespace = tree_list.taxon_namespace
@@ -942,6 +1013,7 @@ class FuncTree:
         # tips not asked for are removed, including tips without a label
         for tree in tree_list:
             tree.retain_taxa_with_labels(wanted)
+            clear_stem(tree)
         self.drop_unused_taxa(tree_list)
         return tree_list
 
@@ -1304,6 +1376,160 @@ class FuncTree:
         lines = ["\t".join(header)] + ["\t".join(str(v) for v in row) for row in rows]
         self.emit("\n".join(lines), "comparison")
 
+    # methods corresponding to prune code block
+
+    def get_pruned_trees(self):
+
+        max_length = self.options.get("max_length")
+        max_ratio = self.options.get("max_ratio")
+        if max_length is None and max_ratio is None:
+            raise TreekitError("give --max-length, --max-ratio, or both")
+
+        tree_list = self.read_all_trees()
+        failed = {}
+        plans = []
+        single_tip_trees = []
+        removed_total = 0
+        for index, tree in enumerate(tree_list, start=1):
+            edges = [node.edge for node in tree.preorder_node_iter() if node is not tree.seed_node]
+            lengths = [float(edge.length) for edge in edges if edge.length is not None]
+            if not lengths or not any(lengths):
+                failed.setdefault("no branch lengths", []).append(index)
+                plans.append([])
+                continue
+
+            # the thresholds of this tree, from the branch lengths before pruning
+            limits = []
+            if max_length is not None:
+                limits.append(max_length)
+            median = statistics.median(lengths)
+            if max_ratio is not None:
+                if median > 0:
+                    limits.append(max_ratio * median)
+                elif max_length is None:
+                    failed.setdefault("the median branch length is 0", []).append(index)
+                    plans.append([])
+                    continue
+            limit = min(limits)
+
+            long_tips = [leaf for leaf in tree.leaf_node_iter()
+                         if leaf.edge.length is not None and float(leaf.edge.length) > limit]
+            n_tips = len(tree.leaf_nodes())
+            if long_tips and len(long_tips) == n_tips:
+                raise TreekitError(
+                    "every tip of tree %d has a branch longer than %s; nothing would be left"
+                    % (index, format_number(limit)))
+            if long_tips and n_tips - len(long_tips) == 1:
+                single_tip_trees.append(index)
+            for leaf in long_tips:
+                log.info("tree %d: removed %s (branch %s, %s x the median %s)" % (
+                    index, leaf.taxon.label if leaf.taxon is not None else "(no label)",
+                    format_number(leaf.edge.length),
+                    format_number(float(leaf.edge.length) / median) if median > 0 else "NA",
+                    format_number(median)))
+            removed_total += len(long_tips)
+            plans.append(long_tips)
+
+        for reason, numbers in failed.items():
+            message = "%d tree(s) cannot be pruned (%s): tree %s" % (
+                len(numbers), reason, format_numbers(numbers))
+            if self.strict:
+                raise TreekitError(message + " (--strict)")
+            log.warning(message + "; written unchanged")
+        self.warn_single_tip_trees(single_tip_trees, "pruning")
+
+        for tree, long_tips in zip(tree_list, plans):
+            for leaf in long_tips:
+                tree.prune_subtree(leaf, suppress_unifurcations=True)
+            if long_tips:
+                clear_stem(tree)
+
+        changed = sum(1 for plan in plans if plan)
+        log.info("removed %d tip(s) from %d of %d trees" % (removed_total, changed, len(tree_list)))
+        if removed_total == 0:
+            log.warning("no tip has a branch longer than the threshold; trees are unchanged")
+        self.drop_unused_taxa(tree_list)
+        return tree_list
+
+    def write_pruned_trees(self):
+
+        self.write_trees(self.get_pruned_trees())
+
+    # methods corresponding to collapse code block
+
+    def get_collapsed_trees(self):
+
+        threshold = self.options.get("min_support")
+        key = self.options.get("support_key")
+        field = self.options.get("support_field")
+
+        # annotations such as [&posterior=0.98] are only read when they are used
+        tree_list = self.read_all_trees(extract_comment_metadata=bool(key))
+        self.keep_annotations = bool(key)
+
+        failed = {}
+        values = []
+        unreadable = 0
+        collapsed_total = 0
+        changed = 0
+        for index, tree in enumerate(tree_list, start=1):
+            supports = {}
+            for node in tree.postorder_internal_node_iter():
+                if node is tree.seed_node:
+                    continue
+                raw = node_support_text(node, key)
+                if raw is None:
+                    continue
+                value = parse_support(raw, field)
+                if value is None:
+                    unreadable += 1
+                else:
+                    supports[node] = value
+            if not supports:
+                reason = ("no '%s' annotation" % key) if key else \
+                         "no numeric support in the node labels"
+                failed.setdefault(reason, []).append(index)
+                continue
+            values.extend(supports.values())
+
+            # collapse from the tips up; a collapsed branch's length goes to its children
+            low = [node for node in supports if supports[node] < threshold]
+            for node in low:
+                node.edge.collapse(adjust_collapsed_head_children_edge_lengths=True)
+            if low:
+                changed += 1
+                collapsed_total += len(low)
+
+        for reason, numbers in failed.items():
+            message = "%d tree(s) have %s: tree %s" % (len(numbers), reason, format_numbers(numbers))
+            if not key and reason.startswith("no numeric"):
+                message += " (for labels like 80/95 use --support-field)"
+            if self.strict:
+                raise TreekitError(message + " (--strict)")
+            log.warning(message + "; written unchanged")
+        if unreadable:
+            log.warning("%d node label(s) are not numbers and were left as they are%s"
+                        % (unreadable, "" if field else
+                           " (for labels like 80/95 use --support-field)"))
+
+        # a threshold on the wrong scale would collapse everything or nothing
+        if values:
+            largest = max(values)
+            if largest <= 1 and threshold > 1:
+                log.warning("supports are between 0 and 1 but --min-support is %s: "
+                            "every supported branch is collapsed" % format_number(threshold))
+            elif largest > 1 and 0 < threshold < 1:
+                log.warning("supports go up to %s but --min-support is %s: did you mean %s?"
+                            % (format_number(largest), format_number(threshold),
+                               format_number(threshold * 100)))
+        log.info("collapsed %d branch(es) in %d of %d trees"
+                 % (collapsed_total, changed, len(tree_list)))
+        return tree_list
+
+    def write_collapsed_trees(self):
+
+        self.write_trees(self.get_collapsed_trees())
+
     # general methods for commands that write trees
 
     def drop_unused_taxa(self, tree_list):
@@ -1322,7 +1548,8 @@ class FuncTree:
         # keep quotes where labels need them, e.g. 'A(1)' or 'B,2'
         tree_out = tree_list.as_string(
             schema=self.out_format,
-            unquoted_underscores=True
+            unquoted_underscores=True,
+            suppress_annotations=not getattr(self, "keep_annotations", False)
         )
         self.emit(tree_out, "trees")
 
@@ -1705,6 +1932,41 @@ class TreeSplits:
                                    if 2 <= popcount(s) <= n_taxa - 2)
         self._cache[key] = (nontrivial, weights)
         return nontrivial, weights
+
+def clear_stem(tree):
+
+    # after pruning, the new root may keep the length of the branch above it;
+    # that is not a branch of the tree (it would count in the tree length)
+    tree.seed_node.edge.length = None
+
+def node_support_text(node, key=None):
+
+    # the raw support of the branch above node: an annotation, or the node label
+    if key is None:
+        return node.label
+    for annotation in node.annotations:
+        if annotation.name == key:
+            return annotation.value
+    return None
+
+def parse_support(text, field=None):
+
+    # a number, or the n-th '/'-separated number of labels such as "80.5/97"
+    text = str(text).strip()
+    if field is not None:
+        parts = text.split("/")
+        if field > len(parts):
+            return None
+        text = parts[field - 1].strip()
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
+
+def format_number(value):
+
+    return "%g" % float(value)
 
 def format_numbers(numbers, limit=20):
 

@@ -115,13 +115,11 @@ class TestInputPaths:
 
 class TestCommandDispatch:
 
-    @pytest.mark.parametrize("command", treekit.PLANNED_COMMANDS)
-    def test_planned_command_reports_not_implemented(self, run, write, command):
-        path = write("ok.tre", ULTRA + "\n")
-        result = run(command, "-i", str(path))
-        assert result.returncode == 2
-        assert "not implemented yet" in result.stderr
-        assert "Traceback" not in result.stderr
+    def test_every_command_of_the_readme_is_implemented(self):
+        assert treekit.PLANNED_COMMANDS == ()
+        assert set(treekit.IMPLEMENTED_COMMANDS) == {
+            "summary", "taxa", "remove", "keep", "mrca", "extract", "prune", "root",
+            "draw", "compare", "collapse"}
 
     def test_unknown_command_is_rejected(self, run):
         result = run("bogus")

@@ -102,7 +102,8 @@ class TestExtract:
         path = write("s.tre", SINGLE)
         names = write("keep.txt", "A\n\nB\n")
         result = run("extract", "-f", str(names), "-i", str(path))
-        assert result.stdout.strip() == "(A:1.0,B:1.0):1.0;"
+        # no stem: the branch above the new root is not a branch of the tree
+        assert result.stdout.strip() == "(A:1.0,B:1.0);"
 
     def test_nexus_output_declares_only_extracted_taxa(self, run, write):
         path = write("m.tre", MULTI)
@@ -215,4 +216,18 @@ class TestKeep:
         run("keep", "-n", "A", "B", "-o", str(kept), "-i", str(path))
         result = run("extract", "-n", "A", "B", "-i", str(kept))
         assert result.returncode == 0, result.stderr
-        assert result.stdout.strip() == "(A:1.0,B:1.0):1.0;"
+        assert result.stdout.strip() == "(A:1.0,B:1.0);"
+
+
+class TestNoStemAfterPruning:
+
+    @pytest.mark.parametrize("args", [("remove", "-n", "C"), ("extract", "-n", "A", "B")])
+    def test_tree_length_is_not_inflated(self, run, write, tmp_path, args):
+        # removing the whole side C of the root used to leave "(A:1,B:1):1;",
+        # and summary then counted that stem: a tree length of 3 instead of 2
+        path = write("s.tre", "((A:1,B:1):1,C:2);\n")
+        out = tmp_path / "out.tre"
+        run(*args, "-o", str(out), "-i", str(path))
+        assert out.read_text().strip() == "(A:1.0,B:1.0);"
+        detail = run("summary", "-e", "-i", str(out)).stdout.splitlines()[1].split("\t")
+        assert detail[6] == "2.0"

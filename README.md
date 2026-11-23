@@ -32,10 +32,11 @@ The options of commands are:
     keep        pick-up the trees with specific taxa
     mrca        check the monophyly or extract the clade based on given taxa/group
     extract     generate subtrees only consist of the given taxa
-    prune       (planned) prune trees with specific branchlength
+    prune       prune trees with specific branchlength
     root        root/reroot/unroot trees
     draw        display trees as textplot
     compare     compare trees between two different sources
+    collapse    collapse branches with low support into polytomies
 Use treekit <command> -h for help with arguments of the command of interest
 ```
 
@@ -156,6 +157,29 @@ one character (noted in the log).
 * Trees are compared as unrooted trees by default; `--rooted` compares clades instead.
 * The number of rows is the product of the two tree counts (846 x 846 trees: about 0.7 million
   rows in about 30 s).
+
+### prune
+`treekit prune --max-ratio 10 -i trees.tre` removes the tips whose branch is longer than 10 times
+the median branch length of their tree; `--max-length 0.5` removes the tips whose branch is longer
+than 0.5. With both, a tip longer than either limit is removed. Only tip branches are tested, in one
+pass, on the branch lengths before pruning; the log lists every removed tip.
+
+* A tree without branch lengths (or, with `--max-ratio` alone, with a median branch length of 0)
+  is written unchanged with a warning; `--strict` makes this an error.
+* The run stops if every tip of a tree would be removed, and warns about trees left with one tip.
+
+### collapse
+`treekit collapse -m 70 -i trees.tre` collapses every internal branch whose support is lower than
+70 into a polytomy. The length of a collapsed branch is added to the branches below it, so
+root-to-tip distances (and ultrametric trees) are kept. Tips and the root are never collapsed.
+
+* Supports are read from the node labels, as written by RAxML or IQ-TREE (`)95:0.1`). For labels
+  like `85.3/97` (SH-aLRT/UFBoot), `--support-field 2` uses the second number.
+* `--support-key posterior` reads them from annotations such as `[&posterior=0.98]` (BEAST,
+  MrBayes); the annotations are kept in the output.
+* Branches without a readable support are left as they are. A tree without any support is
+  written unchanged with a warning (an error with `--strict`).
+* A threshold on the wrong scale gets a warning (e.g. `-m 0.7` with supports up to 100).
 
 ## Examples
 Sample data is in `examples/`:

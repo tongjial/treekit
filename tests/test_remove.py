@@ -156,7 +156,8 @@ class TestDegenerateTrees:
         result = run("remove", "-n", "A", "B", "-i", str(path))
         assert result.returncode == 0, result.stderr
         assert "leaves 1 tree(s) with a single tip (tree 1)" in result.stderr
-        assert "C:2.0;" in result.stdout
+        # a single tip has no branch, so no length is written
+        assert result.stdout.strip() == "C;"
 
     def test_single_tip_warning_is_one_line_for_many_trees(self, run, write):
         # every tree loses A and B, leaving one tip each: one summary line, not one per tree

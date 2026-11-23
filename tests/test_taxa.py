@@ -124,7 +124,7 @@ class TestSeveralInputFiles:
         result = run("remove", "-n", "C", "-i", "a.tre", "n.nex")
         assert result.returncode == 0, result.stderr
         lines = [line for line in result.stdout.splitlines() if line.strip()]
-        assert lines == ["(A:1.0,B:1.0):1.0;", "D:1.0;"]
+        assert lines == ["(A:1.0,B:1.0);", "D;"]
         assert "single tip" in result.stderr
 
     def test_nexus_output_covers_the_taxa_of_all_files(self, run, write):

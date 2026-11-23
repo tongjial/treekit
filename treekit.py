@@ -8,9 +8,33 @@ import dendropy
 from dendropy.utility.error import DataParseError
 import statistics
 
-# subcommands that are implemented, and ones listed in the roadmap
-IMPLEMENTED_COMMANDS = ("summary", "taxa", "remove")
-PLANNED_COMMANDS = ("extract", "keep", "mrca", "prune", "root", "draw", "compare")
+# every subcommand: name, one-line help, and the FuncTree method that runs it;
+# the order is the order of the usage text. A method of None means "planned".
+COMMANDS = (
+    ("summary", "view trees summary", "write_summaries"),
+    ("taxa", "view taxa summary", "write_taxa_out"),
+    ("remove", "remove specific taxa/tips from trees", "write_reduced_trees"),
+    ("keep", "pick-up the trees with specific taxa", None),
+    ("mrca", "check the monophyly or extract the clade based on given taxa/group", None),
+    ("extract", "generate subtrees only consist of the given taxa", None),
+    ("prune", "prune trees with specific branchlength", None),
+    ("root", "root/reroot/unroot trees", None),
+    ("draw", "display trees as textplot", None),
+    ("compare", "compare trees between two different sources", None),
+)
+COMMAND_RUNNERS = {name: method for name, _, method in COMMANDS if method}
+IMPLEMENTED_COMMANDS = tuple(name for name, _, method in COMMANDS if method)
+PLANNED_COMMANDS = tuple(name for name, _, method in COMMANDS if not method)
+
+def usage_text():
+
+    # the usage text lists every command, marking the ones not implemented yet
+    lines = ["treekit <command> [<args>]", "The treekit commands are:"]
+    for name, help_text, method in COMMANDS:
+        prefix = "" if method else "(planned) "
+        lines.append("    %-12s%s%s" % (name, prefix, help_text))
+    lines.append("Use treekit <command> -h for help with arguments of the command of interest")
+    return "\n".join(lines) + "\n"
 
 class TreekitError(Exception):
     """User-facing error: reported on stderr with exit status 1."""
@@ -87,22 +111,7 @@ class ParsedArgs:
     def __init__(self):
 
         # initialize the main ArgumentParser object
-        parser = argparse.ArgumentParser(
-            usage='''treekit <command> [<args>]
-The treekit commands are:
-    summary     view trees summary
-    taxa        view taxa summary
-    remove      remove specific taxa/tips from trees
-    keep        (planned) pick-up the trees with specific taxa
-    mrca        (planned) check the monophyly or extract the clade based on given taxa/group
-    extract     (planned) generate subtrees only consist of the given taxa
-    prune       (planned) prune trees with specific branchlength
-    root        (planned) root/reroot/unroot trees
-    draw        (planned) display trees as textplot
-    compare     (planned) compare trees between two different sources
-Use treekit <command> -h for help with arguments of the command of interest
-'''
-        )
+        parser = argparse.ArgumentParser(usage=usage_text())
 
         # add the main argument "command"
         parser.add_argument(
@@ -117,8 +126,61 @@ Use treekit <command> -h for help with arguments of the command of interest
         if self.args.command not in IMPLEMENTED_COMMANDS:
             parser.error("unrecognized command '%s'" % self.args.command)
 
-        # use dispatch pattern to parse the rest of args, once
-        self.parsed = getattr(self, self.args.command)()
+        # build the parser of the command and parse the rest of args, once
+        command = self.args.command
+        help_text = dict((name, text) for name, text, _ in COMMANDS)[command]
+        sub_parser = argparse.ArgumentParser(
+            prog = "treekit " + command,
+            description = help_text[0].upper() + help_text[1:],
+        )
+        getattr(self, command)(sub_parser)
+        self.add_common_args(sub_parser)
+        self.parsed = sub_parser.parse_args(sys.argv[2:])
+
+    # helpers for arguments shared by several commands
+
+    def add_taxa_args(self, parser, purpose):
+
+        # the taxa a command works on: from the command line or from a file
+        group = parser.add_mutually_exclusive_group(required=True)
+        group.add_argument(
+            "-n",
+            "--taxa-list",
+            nargs = "+",
+            dest = "taxa_list",
+            type = str,
+            help = "Taxa names %s (white-space separated)." % purpose,
+        )
+        group.add_argument(
+            "-f",
+            "--taxa-file",
+            dest = "taxa_file",
+            type = str,
+            help = "File with the taxa names %s (one name per line)." % purpose,
+        )
+        return group
+
+    def add_tree_out_args(self, parser):
+
+        # commands that write trees can write newick or nexus
+        parser.add_argument(
+            "-u",
+            "--out-format",
+            dest = "out_format",
+            choices = ["newick", "nexus"],
+            default = "newick",
+            help = "Format for output trees. Default: newick"
+        )
+
+    def add_strict_arg(self, parser, help_text):
+
+        parser.add_argument(
+            "--strict",
+            dest = "strict",
+            action = "store_true",
+            default = False,
+            help = help_text
+        )
 
     def add_common_args(self, parser):
 
@@ -166,12 +228,7 @@ Use treekit <command> -h for help with arguments of the command of interest
             help = "Append run details and warnings to this log file."
         )
 
-    def summary(self):
-
-        # summarize the tree features
-        parser = argparse.ArgumentParser(
-            description="View trees summary",
-        )
+    def summary(self, parser):
 
         # if give option '-e', then output the details
         parser.add_argument(
@@ -183,17 +240,7 @@ Use treekit <command> -h for help with arguments of the command of interest
             help = "Details of each tree summary."
         )
 
-        # add shared arguments
-        self.add_common_args(parser)
-        args = parser.parse_args(sys.argv[2:])
-        return args
-
-    def taxa(self):
-
-        # view the taxon namespace in various ways
-        parser = argparse.ArgumentParser(
-            description="View taxa summary",
-        )
+    def taxa(self, parser):
 
         # list common taxa names
         parser.add_argument(
@@ -205,59 +252,12 @@ Use treekit <command> -h for help with arguments of the command of interest
             help = "only list common taxa names in all trees."
         )
 
-        # add shared arguments
-        self.add_common_args(parser)
-        args = parser.parse_args(sys.argv[2:])
-        return args
+    def remove(self, parser):
 
-    def remove(self):
-        parser = argparse.ArgumentParser(
-            description="remove specific taxa from given trees",
-        )
-
-        # two options for input taxa names
-        group = parser.add_mutually_exclusive_group(
-            required=True
-        )
-
-        group.add_argument(
-            "-n",
-            "--taxa-list",
-            nargs = "+",
-            dest = "taxa_list",
-            type = str,
-            help = "Input taxa names to be removed (with white-space separated).",
-        )
-
-        group.add_argument(
-            "-f",
-            "--taxa-file",
-            dest = "taxa_file",
-            type = str,
-            help = "File with taxa to be removed (one taxa per line)."
-        )
-
-        parser.add_argument(
-            "-u",
-            "--out-format",
-            dest = "out_format",
-            choices = ["newick", "nexus"],
-            default = "newick",
-            help = "Format for output trees. Default: newick"
-        )
-
-        parser.add_argument(
-            "--strict",
-            dest = "strict",
-            action = "store_true",
-            default = False,
-            help = "Exit with an error if a taxon to remove is absent from all trees."
-        )
-
-        # add shared arguments
-        self.add_common_args(parser)
-        args = parser.parse_args(sys.argv[2:])
-        return args
+        self.add_taxa_args(parser, "to be removed")
+        self.add_tree_out_args(parser)
+        self.add_strict_arg(
+            parser, "Exit with an error if a taxon to remove is absent from all trees.")
 
     def get_args_dict(self):
 
@@ -274,7 +274,9 @@ class FuncTree:
 
     def __init__(self, **kwargs):
 
-        # set defaults and get values from kwargs
+        # set defaults and get values from kwargs; every option is also kept in
+        # self.options for the commands that need one of their own
+        self.options = dict(kwargs)
         self.command = kwargs.get("command")
         self.log_file = kwargs.get("log_file")
         self.strict = bool(kwargs.get("strict"))
@@ -661,7 +663,11 @@ class FuncTree:
 
     def get_taxa_to_remove(self):
 
-        # the taxa names to remove, from -n or from -f (one name per line)
+        return self.get_requested_taxa("to remove")
+
+    def get_requested_taxa(self, purpose):
+
+        # the taxa names given with -n or with -f (one name per line)
         if self.taxa_file:
             if not self.taxa_file.is_file():
                 raise TreekitError("taxa file not found: '%s'" % self.taxa_file)
@@ -676,7 +682,7 @@ class FuncTree:
         # drop blank lines and duplicates, keeping the given order
         names = list(dict.fromkeys(name for name in names if name))
         if not names:
-            raise TreekitError("no taxa given to remove")
+            raise TreekitError("no taxa given %s" % purpose)
         return names
 
     def get_reduced_trees(self):
@@ -825,15 +831,8 @@ def main():
         log.info("run: treekit " + " ".join(sys.argv[1:]))
         func_tree = FuncTree(**kwargs)
 
-        # run FuncTree methods to get outputs
-        if func_tree.command == "summary":
-            func_tree.write_summaries()
-
-        if func_tree.command == "taxa":
-            func_tree.write_taxa_out()
-
-        if func_tree.command == "remove":
-            func_tree.write_reduced_trees()
+        # run the FuncTree method of the command
+        getattr(func_tree, COMMAND_RUNNERS[func_tree.command])()
     except TreekitError as err:
         log.error(str(err))
         sys.exit(1)

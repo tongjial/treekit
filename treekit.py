@@ -19,7 +19,7 @@ COMMANDS = (
     ("extract", "generate subtrees only consist of the given taxa", "write_extracted_trees"),
     ("prune", "prune trees with specific branchlength", None),
     ("root", "root/reroot/unroot trees", "write_rooted_trees"),
-    ("draw", "display trees as textplot", None),
+    ("draw", "display trees as textplot", "write_drawings"),
     ("compare", "compare trees between two different sources", None),
 )
 COMMAND_RUNNERS = {name: method for name, _, method in COMMANDS if method}
@@ -322,6 +322,41 @@ class ParsedArgs:
         self.add_strict_arg(
             parser, "Exit with an error if a group taxon is absent from all trees, or if a "
                     "clade cannot be extracted.")
+
+    def draw(self, parser):
+
+        parser.add_argument(
+            "-t",
+            "--tree",
+            nargs = "+",
+            dest = "tree_numbers",
+            type = positive_int,
+            help = "Draw only these trees (numbers counted over all input files)."
+        )
+        parser.add_argument(
+            "-w",
+            "--width",
+            dest = "width",
+            type = positive_int,
+            default = 80,
+            help = "Width of the drawing in characters. Default: 80"
+        )
+        parser.add_argument(
+            "-m",
+            "--metric",
+            dest = "metric",
+            choices = ["auto", "length", "topology"],
+            default = "auto",
+            help = "Scale branches by length, or draw the topology only. Default: auto "
+                   "(length when every branch has a positive length)"
+        )
+        parser.add_argument(
+            "-s",
+            "--supports",
+            dest = "show_supports",
+            action = "store_true",
+            help = "Show internal node labels, such as branch supports."
+        )
 
     def get_args_dict(self):
 
@@ -1109,6 +1144,41 @@ class FuncTree:
         self.drop_unused_taxa(clades)
         self.write_trees(clades)
 
+    # methods corresponding to draw code block
+
+    def write_drawings(self):
+
+        tree_list, sources = self.read_all_trees_with_sources()
+        total = len(tree_list)
+        numbers = self.options.get("tree_numbers") or list(range(1, total + 1))
+        too_large = [n for n in numbers if n > total]
+        if too_large:
+            raise TreekitError(
+                "there are %d input trees; no tree %s" % (total, format_numbers(too_large)))
+        width = self.options.get("width") or 80
+        if width < 20:
+            raise TreekitError("-w/--width must be at least 20")
+
+        drawings = []
+        topology_only = []
+        for number in dict.fromkeys(numbers):
+            tree = tree_list[number - 1]
+            source, index = sources[number - 1]
+            picture, metric = draw_tree(
+                tree, width, self.options.get("metric") or "auto",
+                bool(self.options.get("show_supports")))
+            if metric == "topology" and self.options.get("metric") == "auto":
+                topology_only.append(number)
+            title = "tree %d (%s, tree %d)" % (number, source, index)
+            if tree.label:
+                title += " %s" % tree.label
+            drawings.append(title + "\n" + picture)
+        if topology_only:
+            log.info("drawn as topology, because branch lengths are missing, zero, or too "
+                     "uneven to draw to scale at this width: tree %s"
+                     % format_numbers(topology_only))
+        self.emit("\n\n".join(drawings), "drawings")
+
     # general methods for commands that write trees
 
     def drop_unused_taxa(self, tree_list):
@@ -1416,6 +1486,52 @@ def extract_group_clade(tree, status):
     clade.seed_node.edge.length = None
     clade.is_rooted = True
     return clade
+
+def lengths_are_drawable(tree, width):
+
+    # drawn to scale, most branches should be at least one character long;
+    # one very long branch would otherwise squeeze the rest of the tree
+    labels = [len(leaf.taxon.label) if leaf.taxon is not None else 10
+              for leaf in tree.leaf_node_iter()]
+    columns = max(width - max(labels) - 2, 10)
+    depth = max(leaf.distance_from_root() for leaf in tree.leaf_node_iter())
+    lengths = sorted(float(node.edge.length) for node in tree.preorder_node_iter()
+                     if node is not tree.seed_node)
+    if depth <= 0:
+        return False
+    return statistics.median(lengths) * columns / depth >= 1
+
+def draw_tree(tree, width, metric="auto", show_supports=False):
+
+    # a text drawing of one tree; returns the drawing and the metric used
+    leaves = tree.leaf_nodes()
+    if len(leaves) == 1:
+        leaf = leaves[0]
+        return "--- " + (leaf.taxon.label if leaf.taxon else "(no label)"), "topology"
+
+    edges = [node.edge for node in tree.preorder_node_iter() if node is not tree.seed_node]
+    has_lengths = all(edge.length is not None and edge.length > 0 for edge in edges)
+    if metric == "length" and not has_lengths:
+        raise TreekitError(
+            "-m length needs a positive length on every branch; use -m topology")
+    if metric == "auto":
+        metric = "length" if has_lengths and lengths_are_drawable(tree, width) else "topology"
+
+    def node_label(node):
+        if node.is_leaf():
+            return node.taxon.label if node.taxon is not None else "(no label)"
+        return node.label if (show_supports and node.label is not None) else "+"
+
+    picture = tree.as_ascii_plot(
+        plot_metric = "length" if metric == "length" else "depth",
+        width = width,
+        show_internal_node_labels = show_supports,
+        node_label_compose_fn = node_label,
+    )
+    lines = [line.rstrip() for line in picture.splitlines()]
+    while lines and not lines[-1]:
+        lines.pop()
+    return "\n".join(lines), metric
 
 def format_numbers(numbers, limit=20):
 

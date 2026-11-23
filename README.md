@@ -34,7 +34,7 @@ The options of commands are:
     extract     generate subtrees only consist of the given taxa
     prune       (planned) prune trees with specific branchlength
     root        root/reroot/unroot trees
-    draw        (planned) display trees as textplot
+    draw        display trees as textplot
     compare     (planned) compare trees between two different sources
 Use treekit <command> -h for help with arguments of the command of interest
 ```
@@ -129,6 +129,14 @@ comment). The table has one row per tree and group:
   trees the MRCA clade, intruders included). In nexus output (`-u nexus`) each clade is named
   `<group>_tree<number>`. Clades that cannot be extracted are skipped with a warning
   (an error with `--strict`).
+
+### draw
+`treekit draw -i trees.tre` draws every tree as text, each under a title with its number, file
+and index in the file. `-t 3 7` draws only trees 3 and 7 (numbers count over all input files),
+`-w 120` sets the width (default 80) and `-s` shows internal node labels such as supports.
+`-m length` scales the branches, `-m topology` ignores their lengths; the default `auto`
+scales them unless lengths are missing or so uneven that most branches would be shorter than
+one character (noted in the log).
 
 ## Examples
 Sample data is in `examples/`:

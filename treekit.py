@@ -1,11 +1,86 @@
 #! /usr/bin/env python3
 
 import argparse, sys, multiprocessing as mp
-from pathlib import Path
+import glob, logging, math, os, re
 from collections import Counter
+from pathlib import Path
 import dendropy
+from dendropy.utility.error import DataParseError
 import statistics
-import time
+
+# subcommands that are implemented, and ones listed in the roadmap
+IMPLEMENTED_COMMANDS = ("summary", "taxa", "remove")
+PLANNED_COMMANDS = ("extract", "keep", "mrca", "prune", "root", "draw", "compare")
+
+class TreekitError(Exception):
+    """User-facing error: reported on stderr with exit status 1."""
+
+# relative/absolute tolerance for comparing leaf heights (ultrametric check)
+ULTRAMETRIC_TOL = 1e-9
+
+# a newick tree made of a single leaf, such as "A;" or "'A b':1.5;"
+BARE_NEWICK = re.compile(
+    r"^('([^']|'')*'|[^\s()\[\]:;,'#]+)(:[-+0-9.eE]+)?\s*;"
+)
+
+# warnings and errors go to stderr; with --log, info lines also go to a log file
+log = logging.getLogger("treekit")
+logging.addLevelName(logging.WARNING, "warning")
+logging.addLevelName(logging.ERROR, "error")
+
+def expand_path(file):
+
+    # an existing path is taken literally, so names containing [ ] work;
+    # anything else is a wildcard pattern
+    if os.path.exists(file):
+        return [file]
+    return sorted(glob.glob(file))
+
+def setup_logging(log_file=None, in_files=()):
+
+    # the log is appended to, so it must never be one of the input files;
+    # this has to be checked before the file is opened
+    if log_file:
+        log_path = Path(log_file).resolve()
+        for pattern in in_files:
+            if any(Path(match).resolve() == log_path for match in expand_path(pattern)):
+                raise TreekitError(
+                    "-l file '%s' is also an input file; choose a different file"
+                    % log_path
+                )
+
+    # reset handlers so that repeated calls do not duplicate output
+    log.handlers.clear()
+    log.setLevel(logging.INFO)
+    log.propagate = False
+
+    console = logging.StreamHandler(sys.stderr)
+    console.setLevel(logging.WARNING)
+    console.setFormatter(logging.Formatter("treekit: %(levelname)s: %(message)s"))
+    log.addHandler(console)
+
+    if log_file:
+        try:
+            # append, so that repeated runs keep a record of every run
+            file_handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+        except OSError as err:
+            raise TreekitError("cannot write log file '%s': %s" % (log_file, err.strerror))
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+        log.addHandler(file_handler)
+    return log
+
+def positive_int(value):
+
+    # argparse type for options such as -c: an integer >= 1
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("invalid integer value: '%s'" % value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be an integer >= 1, got '%s'" % value)
+    return number
 
 class ParsedArgs:
 
@@ -18,32 +93,32 @@ The treekit commands are:
     summary     view trees summary
     taxa        view taxa summary
     remove      remove specific taxa/tips from trees
-    keep        pick-up the trees with specific taxa
-    mrca        check the monophyly or extract the clade based on given taxa/group
-    extract     generate subtrees only consist of the given taxa
-    prune       prune trees with specific branchlength
-    root        root/reroot/unroot trees
-    draw        display trees as textplot
-    compare     compare trees between two different sources
+    keep        (planned) pick-up the trees with specific taxa
+    mrca        (planned) check the monophyly or extract the clade based on given taxa/group
+    extract     (planned) generate subtrees only consist of the given taxa
+    prune       (planned) prune trees with specific branchlength
+    root        (planned) root/reroot/unroot trees
+    draw        (planned) display trees as textplot
+    compare     (planned) compare trees between two different sources
 Use treekit <command> -h for help with arguments of the command of interest
 '''
         )
 
         # add the main argument "command"
         parser.add_argument(
-            "command", 
+            "command",
             help="Subcommand to run"
         )
 
         # parse the command by excluding the rest of args
         self.args = parser.parse_args(sys.argv[1:2])
-        if not hasattr(self, self.args.command):
-            print('Unrecognized command')
-            parser.print_help()
-            exit(1)
-        
-        # use dispatch pattern to invoke method for parsing the rest of args
-        getattr(self, self.args.command)()
+        if self.args.command in PLANNED_COMMANDS:
+            parser.error("command '%s' is not implemented yet" % self.args.command)
+        if self.args.command not in IMPLEMENTED_COMMANDS:
+            parser.error("unrecognized command '%s'" % self.args.command)
+
+        # use dispatch pattern to parse the rest of args, once
+        self.parsed = getattr(self, self.args.command)()
 
     def add_common_args(self, parser):
 
@@ -51,7 +126,7 @@ Use treekit <command> -h for help with arguments of the command of interest
         requiredNamed = parser.add_argument_group(
             'required arguments'
         )
-        
+
         # required arguments
         requiredNamed.add_argument(
             "-i",
@@ -72,14 +147,23 @@ Use treekit <command> -h for help with arguments of the command of interest
             help = "give the outfile name."
         )
 
-        # parallelization is used for file parsing and calculating stats
+        # parallelization is over input files: one process parses one file
         parser.add_argument(
             "-c",
             "--cores",
             dest = "cores",
             default = 1,
-            type = int,
-            help = "Number of cores used. Default: 1"
+            type = positive_int,
+            help = "Number of cores used, at most one per input file. Default: 1"
+        )
+
+        # optional log file for all commands
+        parser.add_argument(
+            "-l",
+            "--log",
+            dest = "log_file",
+            type = str,
+            help = "Append run details and warnings to this log file."
         )
 
     def summary(self):
@@ -103,7 +187,7 @@ Use treekit <command> -h for help with arguments of the command of interest
         self.add_common_args(parser)
         args = parser.parse_args(sys.argv[2:])
         return args
-    
+
     def taxa(self):
 
         # view the taxon namespace in various ways
@@ -125,10 +209,7 @@ Use treekit <command> -h for help with arguments of the command of interest
         self.add_common_args(parser)
         args = parser.parse_args(sys.argv[2:])
         return args
-    
-    def extract(self):
-        pass
-    
+
     def remove(self):
         parser = argparse.ArgumentParser(
             description="remove specific taxa from given trees",
@@ -147,7 +228,7 @@ Use treekit <command> -h for help with arguments of the command of interest
             type = str,
             help = "Input taxa names to be removed (with white-space separated).",
         )
-        
+
         group.add_argument(
             "-f",
             "--taxa-file",
@@ -165,37 +246,24 @@ Use treekit <command> -h for help with arguments of the command of interest
             help = "Format for output trees. Default: newick"
         )
 
+        parser.add_argument(
+            "--strict",
+            dest = "strict",
+            action = "store_true",
+            default = False,
+            help = "Exit with an error if a taxon to remove is absent from all trees."
+        )
+
         # add shared arguments
         self.add_common_args(parser)
         args = parser.parse_args(sys.argv[2:])
         return args
-    
-    def keep(self):
-        pass
-
-    def mrca(self):
-        pass
-
-    def prune(self):
-        pass
-
-    def root(self):
-        pass
-
-    def draw(self):
-        pass
-
-    def compare(self):
-        pass
 
     def get_args_dict(self):
 
         # store arguments in a dictionary
-        command = self.args.__dict__
-        arguments = getattr(self, self.args.command)().__dict__
-        argument_dictionary = command.copy()
-        argument_dictionary.update(arguments)
-        
+        argument_dictionary = dict(self.args.__dict__)
+        argument_dictionary.update(self.parsed.__dict__)
         return argument_dictionary
 
 
@@ -208,171 +276,188 @@ class FuncTree:
 
         # set defaults and get values from kwargs
         self.command = kwargs.get("command")
+        self.log_file = kwargs.get("log_file")
+        self.strict = bool(kwargs.get("strict"))
         self.in_files = self.get_paths(kwargs.get("in_files"))
         self.in_formats = self.get_formats()
-        
+
         # set the optional parameters
         if kwargs.get("out_file"):
             self.out_file = self.get_path(kwargs.get("out_file"))
-        else: 
+        else:
             self.out_file = None
 
         if kwargs.get("out_format"):
             self.out_format = kwargs.get("out_format")
-        else: 
+        else:
             self.out_format = None
-        
-        if kwargs.get("cores"):
-            self.cores = self.get_cores(kwargs.get("cores"))
-        else: 
-            self.cores = 1
+
+        cores = kwargs.get("cores")
+        self.cores = 1 if cores is None else self.get_cores(cores)
+
+        # never write the output over one of the input files
+        if self.out_file is not None and self.out_file in self.in_files:
+            raise TreekitError(
+                "-o file '%s' is also an input file; choose a different file"
+                % self.out_file
+            )
 
         # specific attributes for each command
-        if self.command == "summary":
-            self.details_out = kwargs.get("details_out")
-
-        if self.command == "taxa":
-            self.common_taxa = kwargs.get("common_taxa")
-        
-        if self.command == "remove":
-            
-            if kwargs.get("taxa_list"):
-                self.taxa_list = kwargs.get("taxa_list")
-            else:
-                self.taxa_list = None
-            
-            if kwargs.get("taxa_file"):
-                self.taxa_file = self.get_path(kwargs.get("taxa_file"))
-            else:
-                self.taxa_file = None
-
-        """
-        if self.command == "extract":
-            pass
-        
-        if self.command == "remove":
-            self.taxa_to_remove = kwargs.get("taxa_to_remove")
-            self.taxa_file = kwargs.get("taxa_file")
-            self.out_format = kwargs.get("out_format")
-        """
+        self.details_out = bool(kwargs.get("details_out"))
+        self.common_taxa = bool(kwargs.get("common_taxa"))
+        self.taxa_list = kwargs.get("taxa_list")
+        if kwargs.get("taxa_file"):
+            self.taxa_file = self.get_path(kwargs.get("taxa_file"))
+        else:
+            self.taxa_file = None
 
     def get_paths(self, files):
-        
-        # each in_file may contain asterisk wildcard
+
+        # each in_file may be a relative or absolute path, with optional wildcards
         out_paths = []
         for file in files:
-            paths = Path().glob(file)
-            abs_paths = [path.resolve() for path in paths]
-            out_paths.extend(abs_paths)
+
+            matches = expand_path(file)
+            if not matches:
+                raise TreekitError("input file not found: '%s'" % file)
+            for match in matches:
+                if not os.path.isfile(match):
+                    raise TreekitError("input is not a file: '%s'" % match)
+                out_paths.append(Path(match).resolve())
         return out_paths
-    
+
     def get_path(self, file):
 
         # get outfile absolute path
         out_path = Path(file).resolve()
         return out_path
-    
+
     def get_formats(self):
 
         # identify tree in nexus or newick
         in_formats=[]
         for in_file in self.in_files:
-            with open(in_file, 'r') as f:
-                while True:
-                    line = f.readline().strip()
-                    if line != '': break
-            if line[0] == '#':
-                in_formats.append("nexus")
-            elif line[0] == '(':
-                in_formats.append("newick")
-            else:
-                print("Please input the newick or nexus format tree files")
-                sys.exit()
+            in_formats.append(self.detect_format(in_file))
         return in_formats
-    
+
+    def detect_format(self, in_file):
+
+        # only the beginning of the file is needed to tell the format
+        try:
+            with open(in_file, "rb") as f:
+                head = f.read(65536)
+        except OSError as err:
+            raise TreekitError("cannot read '%s': %s" % (in_file, err.strerror))
+
+        # the tree parser cannot read a byte-order mark
+        if head.startswith(b"\xef\xbb\xbf"):
+            raise TreekitError(
+                "'%s' starts with a UTF-8 byte-order mark (BOM), which cannot be "
+                "parsed; please save the file without BOM" % in_file
+            )
+
+        # skip blank lines and leading [comments], e.g. "[&R]"
+        text = head.decode("utf-8", errors="replace")
+        while True:
+            text = text.lstrip()
+            if not text.startswith("["):
+                break
+            end = text.find("]")
+            text = text[end + 1:] if end != -1 else ""
+
+        if text.startswith("#"):
+            return "nexus"
+        if text.startswith("(") or BARE_NEWICK.match(text):
+            return "newick"
+        raise TreekitError(
+            "'%s' is not a newick or nexus tree file (empty or unrecognized content)"
+            % in_file
+        )
+
+    def read_trees(self, in_file, in_format, tree_list=None, **kwargs):
+
+        # parse one file; parser errors become treekit errors, not tracebacks.
+        # labels are case sensitive: "a" and "A" are two taxa, and removing "a"
+        # must not remove "A" (the dendropy default would merge them)
+        try:
+            if tree_list is None:
+                tree_list = new_tree_list()
+            tree_list.read(
+                path = in_file,
+                schema = in_format,
+                case_sensitive_taxon_labels = True,
+                **kwargs
+            )
+            return tree_list
+        except DataParseError as err:
+            raise TreekitError(
+                "cannot parse '%s' as %s: %s" % (in_file, in_format, " ".join(str(err).split()))
+            )
+        except UnicodeDecodeError:
+            raise TreekitError("'%s' is not valid UTF-8 text" % in_file)
+
     def get_cores(self, cores):
 
         # check the cores attribute
-        assert type(cores) == int and cores > 0, \
-            "-c(--cores) requires int and >1" 
+        if not isinstance(cores, int) or cores < 1:
+            raise TreekitError("-c/--cores requires an integer >= 1")
 
         # if cores > real_cores, use real_cores
         real_cores = mp.cpu_count()
         if cores > real_cores:
-            print("the current computer has up to " + \
-                str(real_cores) + " cores, instead of " + \
-                str(cores) + " cores given by you.\n" + \
-                "as a better way, this job will be running in " + \
-                str(real_cores) + " cores."
+            log.warning(
+                "this computer has %d cores, fewer than the %d requested; "
+                "using %d cores" % (real_cores, cores, real_cores)
             )
             return real_cores
-        else:
-            return cores
+        return cores
+
+    def map_files(self, function):
+
+        # apply function(in_file, in_format) to every input file, one process per file
+        jobs = list(zip(self.in_files, self.in_formats))
+
+        # a single file is handled in-process (no pool, no overhead)
+        if self.cores > 1 and len(jobs) > 1:
+            with mp.Pool(min(self.cores, len(jobs))) as pool:
+                return pool.starmap(function, jobs)
+        return [function(in_file, in_format) for in_file, in_format in jobs]
 
     # code for Meta Functions on a tree object
 
-    def is_binary(self, tree_object):
-
-        # is the rooted/unrooted tree strictly bipartition 
-        multi_nodes = []
-        multifurcating = lambda x: True if len(x.child_nodes()) > 2 else False
-        for node in tree_object.preorder_node_iter(multifurcating):
-            multi_nodes.append(node)
-        
-        # none of multi nodes included in rooted tree 
-        if self.is_rooted(tree_object):
-            if len(multi_nodes) > 0:
-                return False
-            else:
-                return True
-        
-        # at least one multi node included in unrooted tree
-        if not self.is_rooted(tree_object):
-            if len(multi_nodes) > 1:
-                return False
-            else:
-                return True
-    
     def is_rooted(self, tree_object):
 
-        # the tree is rooted when seed node has two children
-        if len(tree_object.seed_node.child_nodes()) == 2:
-            return True
-        
-        # the tree is unrooted when seed node has three children
-        elif len(tree_object.seed_node.child_nodes()) > 2: 
-            return False
+        # the tree is rooted when seed node has two children;
+        # three or more children (unrooted) or a single child are not rooted
+        return len(tree_object.seed_node.child_nodes()) == 2
 
-        # warning if failed to parse the seed node
-        else:
-            print("Invalid tree object, please check the import file")
+    def is_binary(self, tree_object):
+
+        # strictly bifurcating: no node other than the root may have > 2 children
+        seed_node = tree_object.seed_node
+        for node in tree_object.preorder_node_iter():
+            if node is not seed_node and len(node.child_nodes()) > 2:
+                return False
+
+        # the root has two children if rooted, or three if unrooted;
+        # more children (a star-like root) is not binary
+        return len(seed_node.child_nodes()) in (2, 3)
 
     def has_branchlength(self, tree_object):
 
-        # the tree with branch length
-        if tree_object.length() > 0:
-            return True
-        
-        # the tree without branch length
-        elif tree_object.length() == 0:
-            return False
-        
-        # warning if failed to parse the tree length
-        else:
-            print('Invalid tree object, please check the import file')
+        # the tree with branch length has a positive total length
+        return tree_object.length() > 0
 
     def is_ultrametric(self, tree_object):
 
         # two conditions required in an ultrametric tree
         # rooted tree and the same tip heights
         if self.is_rooted(tree_object) and tree_object.length() > 0:
-            tip_heights = tree_object.minmax_leaf_distance_from_root()
-            min_tip_heights = decimal_correct(tip_heights[0])
-            max_tip_heights = decimal_correct(tip_heights[1])
-            if min_tip_heights == max_tip_heights:
-                return True
-            else:
-                return False
+            min_height, max_height = tree_object.minmax_leaf_distance_from_root()
+
+            # heights are floats: compare with a tolerance, not exact equality
+            return math.isclose(min_height, max_height,
+                                rel_tol=ULTRAMETRIC_TOL, abs_tol=ULTRAMETRIC_TOL)
         else:
             return False
 
@@ -384,17 +469,24 @@ class FuncTree:
                 return_leaf_distances_only=True
             )
             return leaf_heights
-        
+
         # or return None
         else:
             return None
 
+    def tip_labels(self, tree_object):
+
+        # labels of all tips; tips without a label are skipped
+        return set(
+            leaf.taxon.label for leaf in tree_object.leaf_node_iter()
+            if leaf.taxon is not None
+        )
+
     # methods corresponding to summary block
-    
+
     def get_summaries(self):
-        
+
         # get summaries for each of tree objects
-        summaries = []
         header = [
             "source",
             "index",
@@ -404,85 +496,53 @@ class FuncTree:
             "is_ultrametric",
             "tree_length",
             "avg_leaf_height",
-            "leaf_height_variance",
+            "leaf_height_sd",
             "num_tips"
         ]
 
-        # generate the tree list object from each of files
-        for in_file, in_format in zip(self.in_files, self.in_formats):
-            tree_list = dendropy.TreeList.get(
-                path = in_file, 
-                schema = in_format
-            )
-            
-            # invoke get_summs function to deal with each tree_list object
-            summs = self.get_summs(tree_list, in_file.name)
-            summaries.extend(summs)
-
+        # one list of rows per file, in the order of the input files
+        per_file = self.map_files(self.get_file_summaries)
+        summaries = [row for rows in per_file for row in rows]
         return header, summaries
 
-    def get_summs(self, tree_list, infile_name):
+    def get_file_summaries(self, in_file, in_format):
 
-        # initialize the properties
-        summs = []
-        source = []
-        index = []
-        is_binary = []
-        is_rooted = []
-        has_brlen = []
-        is_ultrametric = []
-        tree_length = []
-        avg_leaf_height = []
-        leaf_height_variance =[]
-        num_tips = []
+        # one row (all values as strings) for each tree of one file
+        tree_list = self.read_trees(in_file, in_format)
+        if len(tree_list) == 0:
+            raise TreekitError("no trees found in '%s'" % in_file)
 
-        # iterate tree in tree_list
-        for tree_idx, tree_object in enumerate(tree_list):
-
-            # get values for each tree object
-            source.append(infile_name)
-            index.append(tree_idx + 1)
-            is_binary.append(self.is_binary(tree_object))
-            is_rooted.append(self.is_rooted(tree_object))
-            has_brlen.append(self.has_branchlength(tree_object))
-            is_ultrametric.append(self.is_ultrametric(tree_object))
-            tree_length.append(
-                decimal_correct(tree_object.length())
-            )
-            num_tips.append(len(tree_object.leaf_nodes()))
+        rows = []
+        for tree_idx, tree_object in enumerate(tree_list, start=1):
 
             # if leaf heights list is not None, stat the leaf heights
             leaf_heights = self.get_leaf_heights(tree_object)
             if leaf_heights:
-                avg_leaf_height.append(
-                    decimal_correct(statistics.mean(leaf_heights))
-                )
-                leaf_height_variance.append(
-                    decimal_correct(statistics.pstdev(leaf_heights))
-                )
+                avg_leaf_height = decimal_correct(statistics.mean(leaf_heights))
+                leaf_height_sd = decimal_correct(statistics.pstdev(leaf_heights))
             else:
-                avg_leaf_height.append('NA')
-                leaf_height_variance.append('NA')
+                avg_leaf_height = 'NA'
+                leaf_height_sd = 'NA'
 
-        # combine and format the results
-        summs = list(zip(
-            source,
-            map(str, index),
-            map(str, is_binary),
-            map(str, is_rooted),
-            map(str, has_brlen),
-            map(str, is_ultrametric),
-            map(str, tree_length),
-            map(str, avg_leaf_height),
-            map(str, leaf_height_variance),
-            map(str, num_tips)
-        ))
+            values = (
+                in_file.name,
+                tree_idx,
+                self.is_binary(tree_object),
+                self.is_rooted(tree_object),
+                self.has_branchlength(tree_object),
+                self.is_ultrametric(tree_object),
+                decimal_correct(tree_object.length()),
+                avg_leaf_height,
+                leaf_height_sd,
+                len(tree_object.leaf_nodes()),
+            )
+            rows.append(tuple(str(value) for value in values))
 
-        return summs
-    
+        return rows
+
     def get_summstats(self):
 
-        # get summstat for all tree objects
+        # get summstat for all tree objects, one row per input file
         header = [
             "file_name",
             "num_tree",
@@ -491,185 +551,84 @@ class FuncTree:
             "num_hasbrlen",
             "num_ultrametric",
             "avg_tree_length",
-            "tree_length_variance",
+            "tree_length_sd",
             "num_taxa",
             "num_common_taxa"
         ]
 
-        # init the property lists of all input files
-        summstats = []
-        file_names = []
-        num_trees = []
-        num_binary = []
-        num_rooted = []
-        num_hasbrlen = []
-        num_ultrametric = []
-        avg_tree_length = []
-        tree_length_variance = []
-        num_taxa = []
-        num_common_taxa = []
-
-        # pass the trees to TreeList object
-        for in_file, in_format in zip(self.in_files, self.in_formats):
-            tree_list = dendropy.TreeList.get(
-                path = in_file, 
-                schema = in_format
-            )
-
-            # get the values of each file
-            file_names.append(in_file.name)
-            num_trees.append(len(tree_list))
-            num_binary.append(self.get_num_binary(tree_list))
-            num_rooted.append(self.get_num_rooted(tree_list))
-            num_hasbrlen.append(self.get_num_hasbrlen(tree_list))
-            num_ultrametric.append(self.get_num_ultrametric(tree_list))
-            avg_tree_length.append(self.get_avg_tree_length(tree_list))
-            tree_length_variance.append(self.get_tree_length_variance(tree_list))
-            num_taxa.append(len(tree_list.taxon_namespace))
-            num_common_taxa.append(len(self.get_common_taxa(tree_list)))
-
-        # combine and format the results
-        summstats = list(zip(
-            file_names, 
-            map(str, num_trees), 
-            map(str, num_binary),
-            map(str, num_rooted),
-            map(str, num_hasbrlen),
-            map(str, num_ultrametric),
-            map(str, avg_tree_length),
-            map(str, tree_length_variance),
-            map(str, num_taxa),
-            map(str, num_common_taxa)
-        ))
-
+        # each worker parses one file and returns one small row
+        summstats = self.map_files(self.get_file_summstat)
         return header, summstats
 
-    def get_num_binary(self, tree_list):
+    def get_file_summstat(self, in_file, in_format):
 
-        # get number of binary trees in given treelist
-        if self.cores == 1:
-            binary = [self.is_binary(tree_object) for tree_object in tree_list]
-            return Counter(binary)[True]
+        # parse one file and compute its summary row (all values as strings)
+        tree_list = self.read_trees(in_file, in_format)
+        if len(tree_list) == 0:
+            raise TreekitError("no trees found in '%s'" % in_file)
 
-        elif self.cores > 1:
-            pool = mp.Pool(int(self.cores))
-            binary = pool.map(self.is_binary, tree_list)
-            return Counter(binary)[True]
-    
-    def get_num_rooted(self, tree_list):
+        # compute the per-tree properties once, then aggregate
+        metrics = [self.tree_metrics(tree_object) for tree_object in tree_list]
+        lengths = [m[4] for m in metrics]
+        values = (
+            len(tree_list),
+            sum(1 for m in metrics if m[0]),
+            sum(1 for m in metrics if m[1]),
+            sum(1 for m in metrics if m[2]),
+            sum(1 for m in metrics if m[3]),
+            decimal_correct(statistics.mean(lengths)),
+            decimal_correct(statistics.pstdev(lengths)),
+            len(tree_list.taxon_namespace),
+            len(self.get_common_taxa(tree_list)),
+        )
+        return (in_file.name,) + tuple(str(v) for v in values)
 
-        # get number of rooted trees in given treelist
-        if self.cores == 1:
-            rooted = [self.is_rooted(tree_object) for tree_object in tree_list]
-            return Counter(rooted)[True]
+    def tree_metrics(self, tree_object):
 
-        elif self.cores > 1:
-            pool = mp.Pool(int(self.cores))
-            rooted = pool.map(self.is_rooted, tree_list)
-            return Counter(rooted)[True]
-
-    def get_num_hasbrlen(self, tree_list):
-
-        # get the number of trees with branch length
-        if self.cores == 1:
-            hasbrlen = [self.has_branchlength(tree_object) for tree_object in tree_list]
-            return Counter(hasbrlen)[True]
-
-        elif self.cores > 1:
-            pool = mp.Pool(int(self.cores))
-            hasbrlen = pool.map(self.has_branchlength, tree_list)
-            return Counter(hasbrlen)[True]        
-
-    def get_num_ultrametric(self, tree_list):
-
-        # get the number of trees are ultrametric
-        if self.cores == 1:
-            ultrametric = [self.is_ultrametric(tree_object) for tree_object in tree_list]
-            return Counter(ultrametric)[True]
-
-        elif self.cores > 1:
-            pool = mp.Pool(int(self.cores))
-            ultrametric = pool.map(self.is_ultrametric, tree_list)
-            return Counter(ultrametric)[True]
-
-    def get_avg_tree_length(self, tree_list):
-
-        # calculate the average of tree lengths
-        if self.cores == 1:
-            tree_lengths = [tree_object.length() for tree_object in tree_list]
-            return decimal_correct(statistics.mean(tree_lengths))
-
-        elif self.cores > 1:
-            pool = mp.Pool(int(self.cores))
-            tree_lengths = pool.map(dendropy.Tree.length, tree_list)
-            return decimal_correct(statistics.mean(tree_lengths))
-
-    def get_tree_length_variance(self, tree_list):
-
-        # calculate the pstdev of tree lengths
-        if self.cores == 1:
-            tree_lengths = [tree_object.length() for tree_object in tree_list]
-            return decimal_correct(statistics.pstdev(tree_lengths))
-
-        elif self.cores > 1:
-            pool = mp.Pool(int(self.cores))
-            tree_lengths = pool.map(dendropy.Tree.length, tree_list)
-            return decimal_correct(statistics.pstdev(tree_lengths))
+        # all per-tree properties needed by get_summstats, computed once per tree
+        return (
+            self.is_binary(tree_object),
+            self.is_rooted(tree_object),
+            self.has_branchlength(tree_object),
+            self.is_ultrametric(tree_object),
+            tree_object.length(),
+        )
 
     def write_summaries(self):
 
-        # get the detailed summaries
+        # detailed (one row per tree) or brief (one row per file) summaries
         if self.details_out:
-            header, summaries = self.get_summaries()
-            header_out = '\t'.join(header)
-            summ_out = ['\t'.join(summ) for summ in summaries]
-
-            # if outfile is given, then write to outfile
-            if self.out_file != None:
-                self.file_overwrite_warning()
-                with open(self.out_file, "w") as summ_file:
-                    summ_file.write(header_out + '\n')
-                    summ_file.write('\n'.join(summ_out))
-                print("Wrote summaries to file '" + str(self.out_file) + "'")
-
-            # otherwise print to stdout
-            else:
-                print(header_out + '\n' + '\n'.join(summ_out))
-        
-        # Or get the brief summaries
+            header, rows = self.get_summaries()
         else:
-            header, summstats = self.get_summstats()
-            header_out = '\t'.join(header)
-            summ_out = ['\t'.join(summ) for summ in summstats]
+            header, rows = self.get_summstats()
 
-            # if outfile is given, then write to outfile
-            if self.out_file != None:
-                self.file_overwrite_warning()
-                with open(self.out_file, "w") as summ_file:
-                    summ_file.write(header_out + '\n')
-                    summ_file.write('\n'.join(summ_out))
-                print("Wrote summaries to file '" + str(self.out_file) + "'")
-            
-            # otherwise print to stdout
-            else:
-                print(header_out + '\n' + '\n'.join(summ_out))
+        lines = ['\t'.join(header)] + ['\t'.join(row) for row in rows]
+        self.emit('\n'.join(lines), "summaries")
 
     # methods corresponding to taxa code block
 
-    def get_taxa_list(self):
-        
-        # initial treelist, Namespace and out taxalist
-        taxa_space = dendropy.TaxonNamespace()
-        tree_list = dendropy.TreeList(taxon_namespace = taxa_space)
-        taxa_list = []
+    def read_all_trees(self):
 
-        # generate tree objects for all input tree files
+        # every file is parsed on its own, because a NEXUS file declares the number
+        # of its taxa and cannot be read into a namespace already filled by another
+        # file; the trees are then merged into one shared namespace
+        tree_list = new_tree_list()
         for in_file, in_format in zip(self.in_files, self.in_formats):
-            tree_list.read(
-                path = in_file, 
-                schema = in_format,
-                preserve_underscores=True
+            file_trees = self.read_trees(
+                in_file,
+                in_format,
+                preserve_underscores = True
             )
+            for tree in file_trees:
+                tree_list.append(tree)
+        return tree_list
+
+    def get_taxa_list(self):
+
+        # all trees of all input files, and the taxa names in their shared namespace
+        tree_list = self.read_all_trees()
+        taxa_space = tree_list.taxon_namespace
+        taxa_list = []
 
         # if common names are required, get the intersections of labels
         if self.common_taxa:
@@ -685,116 +644,205 @@ class FuncTree:
 
     def get_common_taxa(self, tree_list):
 
-        # get taxa in the first tree
-        taxa_tree0 = set(
-            leaf.taxon.label for leaf in tree_list[0].leaf_nodes()
-        )
+        if len(tree_list) == 0:
+            raise TreekitError("no trees found in the input files")
 
-        # get taxa list in all trees
-        taxa_trees = [
-            [leaf.taxon.label for leaf in tree.leaf_nodes()] 
-            for tree in tree_list
-        ]
-
-        # calculate the intersection between taxa of trees
-        taxa_list = list(taxa_tree0.intersection(*taxa_trees))
-
-        return taxa_list
+        # intersection of the tip labels of all trees
+        taxa_trees = [self.tip_labels(tree) for tree in tree_list]
+        return list(set.intersection(*taxa_trees))
 
     def write_taxa_out(self):
-        
+
         # get taxa for all trees or get the common taxa names
         taxa_out = self.get_taxa_list()
-
-        # if outfile is given, then write to outfile
-        if self.out_file != None:
-            self.file_overwrite_warning()
-            with open(self.out_file, "w") as taxa_file:
-                taxa_file.write('\n'.join(taxa_out))
-            print("Wrote taxa list to the file '" + str(self.out_file) + "'")
-
-        # otherwise print to stdout
-        else:
-            print('\n'.join(taxa_out))
+        self.emit('\n'.join(taxa_out), "taxa list")
 
     # methods corresponding to remove code block
 
-    def get_reduced_trees(self):
-        
-        # initial treelist, namespace
-        taxa_space = dendropy.TaxonNamespace()
-        tree_list = dendropy.TreeList(taxon_namespace = taxa_space)
-        
-        # generate tree list object
-        for in_file, in_format in zip(self.in_files, self.in_formats):
-            tree_list.read(
-                path = in_file, 
-                schema = in_format,
-                preserve_underscores=True
-            )
+    def get_taxa_to_remove(self):
 
-        # parse the list for taxa to be removed 
+        # the taxa names to remove, from -n or from -f (one name per line)
         if self.taxa_file:
-            with open(self.taxa_file, "r") as taxa_file:
-                taxa_list = [line.strip(" \r\n") for line in taxa_file.readlines()]
-                
-        elif self.taxa_list:
-            taxa_list = self.taxa_list
-            
-        # prune the taxa base on labels
+            if not self.taxa_file.is_file():
+                raise TreekitError("taxa file not found: '%s'" % self.taxa_file)
+            try:
+                with open(self.taxa_file, "r", encoding="utf-8") as taxa_file:
+                    names = [line.strip() for line in taxa_file]
+            except UnicodeDecodeError:
+                raise TreekitError("'%s' is not valid UTF-8 text" % self.taxa_file)
+        else:
+            names = [name.strip() for name in self.taxa_list]
+
+        # drop blank lines and duplicates, keeping the given order
+        names = list(dict.fromkeys(name for name in names if name))
+        if not names:
+            raise TreekitError("no taxa given to remove")
+        return names
+
+    def get_reduced_trees(self):
+
+        # read all input trees into one shared taxon namespace
+        tree_list = self.read_all_trees()
+
+        # check the request against every tree before anything is changed
+        taxa_to_remove = self.get_taxa_to_remove()
+        self.check_removal(tree_list, taxa_to_remove)
+
+        # prune the taxa based on labels
         for tree in tree_list:
-            tree.prune_taxa_with_labels(taxa_list)
+            tree.prune_taxa_with_labels(taxa_to_remove)
+
+        # no tree uses the removed taxa any more, so do not declare them in the output
+        taxon_namespace = tree_list.taxon_namespace
+        for name in taxa_to_remove:
+            taxon = taxon_namespace.get_taxon(name)
+            if taxon is not None:
+                taxon_namespace.remove_taxon(taxon)
 
         return tree_list
+
+    def check_removal(self, tree_list, taxa_to_remove):
+
+        # count, for each requested taxon, the trees that contain it
+        total = len(tree_list)
+        requested = set(taxa_to_remove)
+        found = Counter()
+        single_tip_trees = []
+        for index, tree in enumerate(tree_list, start=1):
+            present = set()
+            remaining = 0
+            for leaf in tree.leaf_node_iter():
+
+                # pruning would delete a tip without a label as well, silently
+                if leaf.taxon is None:
+                    raise TreekitError(
+                        "tree %d has a tip without a label; taxa cannot be removed "
+                        "from trees with unlabelled tips" % index
+                    )
+                present.add(leaf.taxon.label)
+                if leaf.taxon.label not in requested:
+                    remaining += 1
+            found.update(requested & present)
+
+            # a tree with no tips left cannot be written, so stop with an error
+            if remaining == 0:
+                raise TreekitError(
+                    "removing these taxa would leave tree %d with no tips" % index
+                )
+            if remaining == 1:
+                single_tip_trees.append(index)
+
+        # one summary line for all trees, instead of one line per tree
+        if single_tip_trees:
+            log.warning(
+                "removing these taxa leaves %d tree(s) with a single tip (tree %s)"
+                % (len(single_tip_trees), ", ".join(map(str, single_tip_trees[:20])))
+                + (" ..." if len(single_tip_trees) > 20 else "")
+            )
+
+        # taxa absent from every tree: nothing would be removed
+        absent = [name for name in taxa_to_remove if found[name] == 0]
+        if absent and len(absent) == len(taxa_to_remove):
+            noun = "taxon" if len(taxa_to_remove) == 1 else "taxa"
+            raise TreekitError(
+                "none of the %d %s to remove were found in any input tree: %s"
+                % (len(taxa_to_remove), noun, ", ".join(absent))
+            )
+
+        # one message for all absent taxa, instead of one line per taxon
+        if absent:
+            noun, verb = ("taxon", "was") if len(absent) == 1 else ("taxa", "were")
+            message = "%d %s %s not found in any input tree: %s" % (
+                len(absent), noun, verb, ", ".join(absent))
+            if self.strict:
+                raise TreekitError(message + " (--strict)")
+            log.warning(message)
+
+        for name in taxa_to_remove:
+            count = found[name]
+            if 0 < count < total:
+                # partial presence is normal for sets of gene trees: log, do not warn
+                log.info("taxon '%s' removed from %d of %d trees" % (name, count, total))
+            elif count == total:
+                log.info("taxon '%s' removed from all %d trees" % (name, total))
 
     def write_reduced_trees(self):
 
         tree_list = self.get_reduced_trees()
-        tree_out = tree_list.as_string(schema=self.out_format).replace("'","")
-        
-        # if out_file is given
-        if self.out_file != None:
-            self.file_overwrite_warning()
-            with open(self.out_file, 'w') as out_file:
-                out_file.write(tree_out)
-        
-        # or output to stdout
-        else:
-            print(tree_out)
+        # keep quotes where labels need them, e.g. 'A(1)' or 'B,2'
+        tree_out = tree_list.as_string(
+            schema=self.out_format,
+            unquoted_underscores=True
+        )
+        self.emit(tree_out, "trees")
 
     # general methods for all common blocks
 
+    def emit(self, text, what):
+
+        # write the result to the outfile if given, or to stdout; always end with a newline
+        text = text.rstrip("\n") + "\n"
+        if self.out_file is None:
+            sys.stdout.write(text)
+            return
+
+        self.file_overwrite_warning()
+        try:
+            with open(self.out_file, "w", encoding="utf-8") as out_file:
+                out_file.write(text)
+        except OSError as err:
+            raise TreekitError("cannot write '%s': %s" % (self.out_file, err.strerror))
+        log.info("wrote %s to '%s'" % (what, self.out_file))
+
     def file_overwrite_warning(self):
 
-        # print warning when overwriting a file
+        # warn when overwriting a file
         if self.out_file.exists():
-            print("WARNING: You are overwriting '" + str(self.out_file) + "'")
+            log.warning("overwriting '%s'" % self.out_file)
 
 # general functions for global invoking
 
+def new_tree_list():
+
+    # an empty tree list whose taxon namespace is case sensitive
+    return dendropy.TreeList(
+        taxon_namespace = dendropy.TaxonNamespace(is_case_sensitive = True)
+    )
+
 def decimal_correct(m, n=9):
-    
-    # keep n decimal places behind the point for input float m
-    return int(float(m) * (10 ** n)) / (10 ** n)
+
+    # round (not truncate) float m to n decimal places
+    return round(float(m), n)
 
 # main function
 
 def main():
-    
-    # initialize parsed arguments and FuncTree objects
-    kwargs = configs()
-    func_tree = FuncTree(**kwargs)
 
-    # run FuncTree methods to get outputs 
-    if func_tree.command == "summary":
-        func_tree.write_summaries()
+    try:
+        # initialize parsed arguments and FuncTree objects
+        kwargs = configs()
+        setup_logging(kwargs.get("log_file"), kwargs.get("in_files"))
+        log.info("run: treekit " + " ".join(sys.argv[1:]))
+        func_tree = FuncTree(**kwargs)
 
-    if func_tree.command == "taxa":
-        func_tree.write_taxa_out()
+        # run FuncTree methods to get outputs
+        if func_tree.command == "summary":
+            func_tree.write_summaries()
 
-    if func_tree.command == "remove":
-        func_tree.write_reduced_trees()
-    
+        if func_tree.command == "taxa":
+            func_tree.write_taxa_out()
+
+        if func_tree.command == "remove":
+            func_tree.write_reduced_trees()
+    except TreekitError as err:
+        log.error(str(err))
+        sys.exit(1)
+    except BrokenPipeError:
+        # the reader closed the pipe (e.g. "| head"): stop quietly
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        sys.exit(1)
+
 def configs():
 
     # initialize parsed arguments
@@ -803,10 +851,7 @@ def configs():
     # get arguments
     config_dict = config.get_args_dict()
     return config_dict
-    
+
 if __name__ == '__main__':
 
-    # start = time.time()
     main()
-    # end = time.time()
-    # print('time consume:', end - start)

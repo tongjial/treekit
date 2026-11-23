@@ -187,6 +187,15 @@ Sample data is in `examples/`:
 treekit summary -i examples/test
 treekit taxa -k -i examples/concat_6genes.trees
 treekit remove -f examples/taxa.txt -i examples/concat_6genes.trees -l remove.log > reduced.tre
+treekit keep -n Badula_crassa_Y24864 Coris_monspeliensis_Y925 -i examples/concat_6genes.trees > kept.tre
+treekit extract -f examples/taxa.txt -i examples/concat_6genes.trees.all > pair.tre
+treekit root --midpoint -i examples/RAxML_bipartitions.all > rooted.tre
+treekit mrca -n Badula_crassa_Y24864 Coris_monspeliensis_Y925 -i examples/concat_6genes.trees
+treekit draw -t 1 -w 100 -i examples/RAxML_bipartitions.all
+treekit compare -i examples/concat_6genes.trees -r examples/concat_6genes.mcc.tre
+treekit prune --max-ratio 12 -i examples/RAxML_bipartitions.all -l prune.log > pruned.tre
+treekit collapse -m 70 -i examples/RAxML_bipartitions.all > collapsed.tre
+treekit collapse -m 0.95 --support-key posterior -i examples/concat_6genes.mcc.tre > collapsed_mcc.tre
 ```
 
 ## Tests

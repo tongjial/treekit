@@ -18,7 +18,7 @@ COMMANDS = (
     ("mrca", "check the monophyly or extract the clade based on given taxa/group", None),
     ("extract", "generate subtrees only consist of the given taxa", "write_extracted_trees"),
     ("prune", "prune trees with specific branchlength", None),
-    ("root", "root/reroot/unroot trees", None),
+    ("root", "root/reroot/unroot trees", "write_rooted_trees"),
     ("draw", "display trees as textplot", None),
     ("compare", "compare trees between two different sources", None),
 )
@@ -139,10 +139,11 @@ class ParsedArgs:
 
     # helpers for arguments shared by several commands
 
-    def add_taxa_args(self, parser, purpose):
+    def add_taxa_args(self, parser, purpose, group=None):
 
         # the taxa a command works on: from the command line or from a file
-        group = parser.add_mutually_exclusive_group(required=True)
+        if group is None:
+            group = parser.add_mutually_exclusive_group(required=True)
         group.add_argument(
             "-n",
             "--taxa-list",
@@ -270,6 +271,28 @@ class ParsedArgs:
 
         self.add_taxa_args(parser, "that a tree must contain")
         self.add_tree_out_args(parser)
+
+    def root(self, parser):
+
+        # exactly one way of rooting
+        group = parser.add_mutually_exclusive_group(required=True)
+        self.add_taxa_args(parser, "of the outgroup", group=group)
+        group.add_argument(
+            "--midpoint",
+            dest = "midpoint",
+            action = "store_true",
+            help = "Root every tree at the midpoint of its longest tip-to-tip path."
+        )
+        group.add_argument(
+            "--unroot",
+            dest = "unroot",
+            action = "store_true",
+            help = "Remove the root: write unrooted trees."
+        )
+        self.add_tree_out_args(parser)
+        self.add_strict_arg(
+            parser, "Exit with an error if a tree cannot be rooted, or if an outgroup "
+                    "taxon is absent from all trees.")
 
     def get_args_dict(self):
 
@@ -881,6 +904,54 @@ class FuncTree:
 
         self.write_trees(self.get_kept_trees())
 
+    # methods corresponding to root code block
+
+    def get_rooted_trees(self):
+
+        tree_list = self.read_all_trees()
+        total = len(tree_list)
+
+        if self.options.get("unroot"):
+            for tree in tree_list:
+                keep_split_labels(tree, unroot_tree)
+            log.info("unrooted %d trees" % total)
+            return tree_list
+
+        # outgroup rooting checks the outgroup against all trees first
+        if self.options.get("midpoint"):
+            mode = "midpoint"
+            root_one = root_at_midpoint
+        else:
+            mode = "outgroup"
+            outgroup = self.get_requested_taxa("of the outgroup")
+            found = Counter()
+            for tree in tree_list:
+                found.update(set(outgroup) & self.tip_labels(tree))
+            self.report_taxa_presence(outgroup, found, total, "of the outgroup", "used in")
+            root_one = lambda tree: root_on_outgroup(tree, outgroup)
+
+        # a tree that cannot be rooted is written unchanged, so the output keeps
+        # the number and the order of the input trees
+        failed = {}
+        for index, tree in enumerate(tree_list, start=1):
+            reason = keep_split_labels(tree, root_one)
+            if reason:
+                failed.setdefault(reason, []).append(index)
+
+        for reason, numbers in failed.items():
+            message = "%d tree(s) cannot be rooted (%s): tree %s" % (
+                len(numbers), reason, format_numbers(numbers))
+            if self.strict:
+                raise TreekitError(message + " (--strict)")
+            log.warning(message + "; written unchanged")
+        not_rooted = sum(len(numbers) for numbers in failed.values())
+        log.info("rooted %d of %d trees (%s)" % (total - not_rooted, total, mode))
+        return tree_list
+
+    def write_rooted_trees(self):
+
+        self.write_trees(self.get_rooted_trees())
+
     # general methods for commands that write trees
 
     def drop_unused_taxa(self, tree_list):
@@ -935,6 +1006,180 @@ def new_tree_list(taxon_namespace=None):
     if taxon_namespace is None:
         taxon_namespace = dendropy.TaxonNamespace(is_case_sensitive = True)
     return dendropy.TreeList(taxon_namespace = taxon_namespace)
+
+# ---------------------------------------------------------------- tree algorithms
+
+def leaf_bit_map(tree):
+
+    # each tip gets one bit; tip nodes are kept by the rerooting operations
+    return {leaf: 1 << i for i, leaf in enumerate(tree.leaf_node_iter())}
+
+def node_masks(tree, bits):
+
+    # for every node, the bit mask of the tips below it
+    masks = {}
+    for node in tree.postorder_node_iter():
+        if node.is_leaf():
+            masks[node] = bits[node]
+        else:
+            mask = 0
+            for child in node.child_node_iter():
+                mask |= masks[child]
+            masks[node] = mask
+    return masks
+
+def split_key(mask, full):
+
+    # a split and its complement are the same split: use the side without tip 0
+    return full ^ mask if mask & 1 else mask
+
+def keep_split_labels(tree, operation):
+
+    # node labels (e.g. branch supports) belong to the split of the branch above
+    # the node; rerooting moves nodes, so labels are put back by split afterwards
+    bits = leaf_bit_map(tree)
+    full = (1 << len(bits)) - 1
+    labels = {}
+    for node, mask in node_masks(tree, bits).items():
+        if node.is_internal() and node is not tree.seed_node and node.label is not None:
+            labels[split_key(mask, full)] = node.label
+
+    result = operation(tree)
+
+    for node, mask in node_masks(tree, bits).items():
+        if node.is_internal():
+            node.label = None if node is tree.seed_node else labels.get(split_key(mask, full))
+    return result
+
+def unroot_tree(tree):
+
+    # merge the two branches at a bifurcating root into one branch
+    if len(tree.seed_node.child_nodes()) == 2 and len(tree.leaf_nodes()) > 2:
+        tree.deroot()
+    tree.is_rooted = False
+
+def float_or_none(value):
+
+    return None if value is None else float(value)
+
+def root_on_edge(tree, edge, distance_from_tail):
+
+    # put a bifurcating root on edge, at distance_from_tail from its tail node
+    length = edge.length
+    if length is None or distance_from_tail is None:
+        tail_part = head_part = None
+    else:
+        tail_part = float(distance_from_tail)
+        head_part = float(length) - tail_part
+    tree.reroot_at_edge(edge, length1=tail_part, length2=head_part)
+    tree.is_rooted = True
+
+def root_on_outgroup(tree, outgroup):
+
+    # returns None when rooted, or the reason why the tree cannot be rooted
+    wanted = set(outgroup)
+    is_out = {leaf: leaf.taxon is not None and leaf.taxon.label in wanted
+              for leaf in tree.leaf_node_iter()}
+    n_out = sum(is_out.values())
+    n_all = len(is_out)
+    if n_out == 0:
+        return "no outgroup taxon in the tree"
+    if n_out == n_all:
+        return "every taxon of the tree is in the outgroup"
+
+    # a tree already rooted between the outgroup and the ingroup is kept as it is,
+    # so that e.g. a time tree stays ultrametric
+    root_children = tree.seed_node.child_nodes()
+    if len(root_children) == 2:
+        for child in root_children:
+            flags = {is_out[leaf] for leaf in child.leaf_iter()}
+            if len(flags) == 1 and (n_out if True in flags else n_all - n_out) == len(child.leaf_nodes()):
+                tree.is_rooted = True
+                return None
+
+    unroot_tree(tree)
+
+    # the outgroup must be one side of a split: a clade, or the complement of one
+    out_below = {}
+    all_below = {}
+    for node in tree.postorder_node_iter():
+        if node.is_leaf():
+            out_below[node] = int(is_out[node])
+            all_below[node] = 1
+        else:
+            out_below[node] = sum(out_below[c] for c in node.child_node_iter())
+            all_below[node] = sum(all_below[c] for c in node.child_node_iter())
+
+    for node in tree.postorder_node_iter():
+        if node is tree.seed_node:
+            continue
+        outgroup_clade = out_below[node] == n_out == all_below[node]
+        ingroup_clade = out_below[node] == 0 and all_below[node] == n_all - n_out
+        if outgroup_clade or ingroup_clade:
+            length = node.edge.length
+            root_on_edge(tree, node.edge, None if length is None else float(length) / 2)
+            return None
+    return "the outgroup is not monophyletic"
+
+def root_at_midpoint(tree):
+
+    # returns None when rooted, or the reason why the tree cannot be rooted
+    unroot_tree(tree)
+    edges = [node.edge for node in tree.preorder_node_iter() if node is not tree.seed_node]
+    if not edges:
+        return "the tree has a single tip"
+    if any(edge.length is None for edge in edges):
+        return "midpoint rooting needs branch lengths"
+
+    # neighbours of every node with the length of the branch between them
+    neighbours = {node: [] for node in tree.preorder_node_iter()}
+    for node in tree.preorder_node_iter():
+        if node is not tree.seed_node:
+            length = float(node.edge.length)
+            neighbours[node].append((node.parent_node, length))
+            neighbours[node.parent_node].append((node, length))
+
+    def farthest_tip(start):
+        distance = {start: 0.0}
+        previous = {start: None}
+        stack = [start]
+        while stack:
+            node = stack.pop()
+            for other, length in neighbours[node]:
+                if other not in distance:
+                    distance[other] = distance[node] + length
+                    previous[other] = node
+                    stack.append(other)
+        tips = [n for n in distance if n.is_leaf()]
+        far = max(tips, key=lambda n: distance[n])
+        return far, distance, previous
+
+    # the longest tip-to-tip path: farthest tip from any tip, then farthest from it
+    a, _, _ = farthest_tip(next(tree.leaf_node_iter()))
+    b, distance, previous = farthest_tip(a)
+    diameter = distance[b]
+    if diameter <= 0:
+        return "all branch lengths are zero"
+    half = diameter / 2.0
+
+    # walk from b towards a until the branch that contains the midpoint
+    node = b
+    while previous[node] is not None:
+        parent_on_path = previous[node]
+        if distance[parent_on_path] <= half <= distance[node]:
+            near, far = parent_on_path, node      # near is on the side of a
+            break
+        node = parent_on_path
+
+    # the branch lies between near and far; find which one is the child
+    if far.parent_node is near:
+        edge = far.edge
+        distance_from_tail = half - distance[near]
+    else:
+        edge = near.edge
+        distance_from_tail = distance[far] - half
+    root_on_edge(tree, edge, min(max(distance_from_tail, 0.0), float(edge.length)))
+    return None
 
 def format_numbers(numbers, limit=20):
 

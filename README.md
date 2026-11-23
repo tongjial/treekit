@@ -33,7 +33,7 @@ The options of commands are:
     mrca        (planned) check the monophyly or extract the clade based on given taxa/group
     extract     generate subtrees only consist of the given taxa
     prune       (planned) prune trees with specific branchlength
-    root        (planned) root/reroot/unroot trees
+    root        root/reroot/unroot trees
     draw        (planned) display trees as textplot
     compare     (planned) compare trees between two different sources
 Use treekit <command> -h for help with arguments of the command of interest
@@ -91,6 +91,22 @@ writes nexus.
 `treekit keep -n A B -i trees.tre` writes, unchanged and in input order, only the trees that
 contain **all** the taxa A and B (or `-f names.txt`). The log lists the kept trees. The run
 stops with an error if no tree contains all of them.
+
+### root
+Exactly one of:
+
+* `treekit root -n O1 O2 -i trees.tre` roots every tree on the outgroup O1, O2 (or `-f names.txt`),
+  in the middle of the outgroup's branch. A tree that lacks some outgroup taxa is rooted on the
+  ones it has. A tree already rooted between the outgroup and the rest is kept as it is, so time
+  trees stay ultrametric.
+* `treekit root --midpoint -i trees.tre` roots every tree halfway along its longest tip-to-tip path
+  (needs branch lengths). An ultrametric tree keeps its root.
+* `treekit root --unroot -i trees.tre` removes the root, merging the two root branches.
+
+A tree that cannot be rooted (no outgroup taxon, an outgroup that is not monophyletic, no branch
+lengths for `--midpoint`) is written unchanged, so the output has the same trees in the same order
+as the input; one warning per reason lists the trees. `--strict` makes this an error.
+Node labels such as branch supports stay on their branch when the root moves.
 
 ## Examples
 Sample data is in `examples/`:

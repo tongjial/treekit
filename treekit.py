@@ -24,6 +24,9 @@ COMMANDS = (
     ("collapse", "collapse branches with low support into polytomies", "write_collapsed_trees"),
 )
 COMMAND_RUNNERS = {name: method for name, _, method in COMMANDS if method}
+# the commands whose output is trees
+TREE_WRITERS = ("write_reduced_trees", "write_kept_trees", "write_extracted_trees",
+                "write_rooted_trees", "write_pruned_trees", "write_collapsed_trees")
 IMPLEMENTED_COMMANDS = tuple(name for name, _, method in COMMANDS if method)
 PLANNED_COMMANDS = tuple(name for name, _, method in COMMANDS if not method)
 
@@ -61,18 +64,29 @@ def expand_path(file):
         return [file]
     return sorted(glob.glob(file))
 
-def setup_logging(log_file=None, in_files=()):
+def check_write_targets(options):
 
-    # the log is appended to, so it must never be one of the input files;
-    # this has to be checked before the file is opened
-    if log_file:
-        log_path = Path(log_file).resolve()
-        for pattern in in_files:
-            if any(Path(match).resolve() == log_path for match in expand_path(pattern)):
-                raise TreekitError(
-                    "-l file '%s' is also an input file; choose a different file"
-                    % log_path
-                )
+    # the output (-o) and the log (-l) must not be a file that the command reads
+    # (trees, -r trees, taxa or groups file), nor the same file as each other.
+    # This runs before any file is opened: the log is opened for appending.
+    read = []
+    for option in ("in_files", "ref_files"):
+        for pattern in options.get(option) or []:
+            read.extend(Path(match).resolve() for match in expand_path(pattern))
+    for option in ("taxa_file", "groups_file"):
+        if options.get(option):
+            read.append(Path(options[option]).resolve())
+
+    targets = [(flag, Path(options[key]).resolve())
+               for flag, key in (("-o", "out_file"), ("-l", "log_file")) if options.get(key)]
+    for flag, path in targets:
+        if path in read:
+            raise TreekitError(
+                "%s file '%s' is also an input file; choose a different file" % (flag, path))
+    if len(targets) == 2 and targets[0][1] == targets[1][1]:
+        raise TreekitError("-o and -l name the same file '%s'; choose two files" % targets[0][1])
+
+def setup_logging(log_file=None):
 
     # reset handlers so that repeated calls do not duplicate output
     log.handlers.clear()
@@ -804,6 +818,10 @@ class FuncTree:
 
     def read_all_trees(self, **kwargs):
 
+        # commands that write trees keep comments such as [&posterior=0.98]
+        if COMMAND_RUNNERS.get(self.command) in TREE_WRITERS:
+            kwargs.setdefault("extract_comment_metadata", True)
+
         # every file is parsed on its own, because a NEXUS file declares the number
         # of its taxa and cannot be read into a namespace already filled by another
         # file; the trees are then merged into one shared namespace
@@ -1072,9 +1090,15 @@ class FuncTree:
         tree_list = self.read_all_trees()
         total = len(tree_list)
 
+        conflicts = []
+        clash_trees = []
+
         if self.options.get("unroot"):
-            for tree in tree_list:
-                keep_split_labels(tree, unroot_tree)
+            for index, tree in enumerate(tree_list, start=1):
+                if keep_split_labels(tree, unroot_tree, conflicts) is None and conflicts:
+                    clash_trees.append(index)
+                    conflicts.clear()
+            self.warn_label_clashes(clash_trees)
             log.info("unrooted %d trees" % total)
             return tree_list
 
@@ -1095,9 +1119,13 @@ class FuncTree:
         # the number and the order of the input trees
         failed = {}
         for index, tree in enumerate(tree_list, start=1):
-            reason = keep_split_labels(tree, root_one)
-            if reason:
+            reason = keep_split_labels(tree, root_one, conflicts)
+            if reason is not None and reason != UNCHANGED:
                 failed.setdefault(reason, []).append(index)
+            if conflicts:
+                clash_trees.append(index)
+                conflicts.clear()
+        self.warn_label_clashes(clash_trees)
 
         for reason, numbers in failed.items():
             message = "%d tree(s) cannot be rooted (%s): tree %s" % (
@@ -1108,6 +1136,14 @@ class FuncTree:
         not_rooted = sum(len(numbers) for numbers in failed.values())
         log.info("rooted %d of %d trees (%s)" % (total - not_rooted, total, mode))
         return tree_list
+
+    def warn_label_clashes(self, tree_numbers):
+
+        if tree_numbers:
+            log.warning(
+                "%d tree(s) had different labels on the two branches at the old root, "
+                "which became one branch; the label of the first branch was kept: tree %s"
+                % (len(tree_numbers), format_numbers(tree_numbers)))
 
     def write_rooted_trees(self):
 
@@ -1354,12 +1390,12 @@ class FuncTree:
                 rf = len(splits_a ^ splits_b)
                 denominator = len(splits_a) + len(splits_b)
                 norm = decimal_correct(rf / denominator) if denominator else "NA"
-                if a.has_lengths and b.has_lengths:
+                if None in weights_a.values() or None in weights_b.values():
+                    weighted = "NA"
+                else:
                     weighted = decimal_correct(sum(
                         abs(weights_a.get(key, 0.0) - weights_b.get(key, 0.0))
                         for key in set(weights_a) | set(weights_b)))
-                else:
-                    weighted = "NA"
                 rows.append((a.source, a.index, b.source, b.index, n_common,
                              only_a, only_b, rf, norm, weighted))
 
@@ -1463,9 +1499,7 @@ class FuncTree:
         key = self.options.get("support_key")
         field = self.options.get("support_field")
 
-        # annotations such as [&posterior=0.98] are only read when they are used
-        tree_list = self.read_all_trees(extract_comment_metadata=bool(key))
-        self.keep_annotations = bool(key)
+        tree_list = self.read_all_trees()
 
         failed = {}
         values = []
@@ -1546,10 +1580,13 @@ class FuncTree:
     def write_trees(self, tree_list):
 
         # keep quotes where labels need them, e.g. 'A(1)' or 'B,2'
+        # labels with spaces are quoted, not turned into underscores ('A B' and
+        # A_B are two taxa); comments such as [&posterior=0.98] are written back
         tree_out = tree_list.as_string(
             schema=self.out_format,
             unquoted_underscores=True,
-            suppress_annotations=not getattr(self, "keep_annotations", False)
+            preserve_spaces=True,
+            suppress_annotations=False
         )
         self.emit(tree_out, "trees")
 
@@ -1612,30 +1649,60 @@ def split_key(mask, full):
     # a split and its complement are the same split: use the side without tip 0
     return full ^ mask if mask & 1 else mask
 
-def keep_split_labels(tree, operation):
+# returned by a rooting operation that left the tree exactly as it was
+UNCHANGED = "unchanged"
 
-    # node labels (e.g. branch supports) belong to the split of the branch above
-    # the node; rerooting moves nodes, so labels are put back by split afterwards
+def keep_split_labels(tree, operation, conflicts=None):
+
+    # node labels and annotations (e.g. branch supports) belong to the split of
+    # the branch above the node; rerooting moves nodes, so they are put back by
+    # split afterwards. The operation returns None when it changed the tree,
+    # UNCHANGED when it did not, or the reason why it could not (the tree is then
+    # untouched); only a changed tree gets its labels re-assigned.
     bits = leaf_bit_map(tree)
     full = (1 << len(bits)) - 1
-    labels = {}
+    saved = {}
+    clash = False
     for node, mask in node_masks(tree, bits).items():
-        if node.is_internal() and node is not tree.seed_node and node.label is not None:
-            labels[split_key(mask, full)] = node.label
+        if not node.is_internal() or node is tree.seed_node:
+            continue
+        data = (node.label, [(a.name, a.value) for a in node.annotations])
+        if data == (None, []):
+            continue
+        key = split_key(mask, full)
+        # the two branches at a bifurcating root are one split: if they carry
+        # different labels, only the first can be kept when they become one branch
+        if key in saved:
+            clash = clash or saved[key] != data
+            continue
+        saved[key] = data
 
     result = operation(tree)
+    if result is not None:
+        return result
 
     for node, mask in node_masks(tree, bits).items():
-        if node.is_internal():
-            node.label = None if node is tree.seed_node else labels.get(split_key(mask, full))
-    return result
+        if not node.is_internal():
+            continue
+        label, annotations = (None, []) if node is tree.seed_node else \
+            saved.get(split_key(mask, full), (None, []))
+        node.label = label
+        node.annotations.clear()
+        for name, value in annotations:
+            node.annotations.add_new(name, value)
+    if clash and conflicts is not None:
+        conflicts.append(True)
+    return None
 
 def unroot_tree(tree):
 
     # merge the two branches at a bifurcating root into one branch
     if len(tree.seed_node.child_nodes()) == 2 and len(tree.leaf_nodes()) > 2:
         tree.deroot()
+        tree.is_rooted = False
+        return None
     tree.is_rooted = False
+    return UNCHANGED
 
 def float_or_none(value):
 
@@ -1666,49 +1733,54 @@ def root_on_outgroup(tree, outgroup):
     if n_out == n_all:
         return "every taxon of the tree is in the outgroup"
 
+    # the outgroup must be one side of a split: a clade, or the complement of one.
+    # This is checked before the tree is changed, so a failure leaves it intact.
+    def outgroup_branch():
+        out_below = {}
+        all_below = {}
+        for node in tree.postorder_node_iter():
+            if node.is_leaf():
+                out_below[node] = int(is_out[node])
+                all_below[node] = 1
+            else:
+                out_below[node] = sum(out_below[c] for c in node.child_node_iter())
+                all_below[node] = sum(all_below[c] for c in node.child_node_iter())
+        for node in tree.postorder_node_iter():
+            if node is tree.seed_node:
+                continue
+            if out_below[node] == n_out == all_below[node] or \
+                    (out_below[node] == 0 and all_below[node] == n_all - n_out):
+                return node
+        return None
+
+    node = outgroup_branch()
+    if node is None:
+        return "the outgroup is not monophyletic"
+
     # a tree already rooted between the outgroup and the ingroup is kept as it is,
     # so that e.g. a time tree stays ultrametric
-    root_children = tree.seed_node.child_nodes()
-    if len(root_children) == 2:
-        for child in root_children:
-            flags = {is_out[leaf] for leaf in child.leaf_iter()}
-            if len(flags) == 1 and (n_out if True in flags else n_all - n_out) == len(child.leaf_nodes()):
-                tree.is_rooted = True
-                return None
+    if len(tree.seed_node.child_nodes()) == 2 and node.parent_node is tree.seed_node:
+        tree.is_rooted = True
+        return UNCHANGED
 
     unroot_tree(tree)
-
-    # the outgroup must be one side of a split: a clade, or the complement of one
-    out_below = {}
-    all_below = {}
-    for node in tree.postorder_node_iter():
-        if node.is_leaf():
-            out_below[node] = int(is_out[node])
-            all_below[node] = 1
-        else:
-            out_below[node] = sum(out_below[c] for c in node.child_node_iter())
-            all_below[node] = sum(all_below[c] for c in node.child_node_iter())
-
-    for node in tree.postorder_node_iter():
-        if node is tree.seed_node:
-            continue
-        outgroup_clade = out_below[node] == n_out == all_below[node]
-        ingroup_clade = out_below[node] == 0 and all_below[node] == n_all - n_out
-        if outgroup_clade or ingroup_clade:
-            length = node.edge.length
-            root_on_edge(tree, node.edge, None if length is None else float(length) / 2)
-            return None
-    return "the outgroup is not monophyletic"
+    node = outgroup_branch()
+    length = node.edge.length
+    root_on_edge(tree, node.edge, None if length is None else float(length) / 2)
+    return None
 
 def root_at_midpoint(tree):
 
-    # returns None when rooted, or the reason why the tree cannot be rooted
-    unroot_tree(tree)
+    # returns None when rooted, or the reason why the tree cannot be rooted;
+    # every reason is found before the tree is changed
     edges = [node.edge for node in tree.preorder_node_iter() if node is not tree.seed_node]
     if not edges:
         return "the tree has a single tip"
     if any(edge.length is None for edge in edges):
         return "midpoint rooting needs branch lengths"
+    if not any(float(edge.length) > 0 for edge in edges):
+        return "all branch lengths are zero"
+    unroot_tree(tree)
 
     # neighbours of every node with the length of the branch between them
     neighbours = {node: [] for node in tree.preorder_node_iter()}
@@ -1903,18 +1975,20 @@ class TreeSplits:
                 masks[parents[i]] |= masks[i]
         self.taxa = masks[0]
         self.edges = [(masks[i], lengths[i]) for i in range(1, len(parents))]
-        self.has_lengths = any(length for _, length in self.edges)
-        self._cache = {}
+        self._full = None
 
     def restricted(self, taxa, rooted):
 
         # the branches of the tree reduced to `taxa`: the non-trivial ones as a set
-        # (for the RF distance) and all of them with summed lengths (weighted RF).
-        # Reducing a tree to a subset of tips keeps exactly the branches whose tip
-        # sets still split that subset, and branches that become one add up.
-        key = (taxa, rooted)
-        if key in self._cache:
-            return self._cache[key]
+        # (for the RF distance) and all of them with summed lengths (weighted RF;
+        # None when a length that would be summed is missing). Reducing a tree to a
+        # subset of tips keeps exactly the branches whose tip sets still split that
+        # subset, and branches that become one add up.
+        # Only the restriction to all the tree's taxa is kept for reuse: other
+        # subsets depend on the other tree of the pair and are rarely repeated.
+        full = taxa == self.taxa
+        if full and self._full is not None and self._full[0] == rooted:
+            return self._full[1]
         lowest = taxa & -taxa
         n_taxa = popcount(taxa)
         weights = {}
@@ -1924,14 +1998,19 @@ class TreeSplits:
                 continue
             if not rooted and side & lowest:
                 side = taxa ^ side        # a split and its complement are one split
-            weights[side] = weights.get(side, 0.0) + (length or 0.0)
+            if length is None or weights.get(side, 0.0) is None:
+                weights[side] = None
+            else:
+                weights[side] = weights.get(side, 0.0) + length
         if rooted:
             nontrivial = frozenset(s for s in weights if popcount(s) >= 2)
         else:
             nontrivial = frozenset(s for s in weights
                                    if 2 <= popcount(s) <= n_taxa - 2)
-        self._cache[key] = (nontrivial, weights)
-        return nontrivial, weights
+        result = (nontrivial, weights)
+        if full:
+            self._full = (rooted, result)
+        return result
 
 def clear_stem(tree):
 
@@ -1986,8 +2065,11 @@ def main():
     try:
         # initialize parsed arguments and FuncTree objects
         kwargs = configs()
-        setup_logging(kwargs.get("log_file"),
-                      list(kwargs.get("in_files") or []) + list(kwargs.get("ref_files") or []))
+        # errors are reported on stderr from here on; the log file is opened only
+        # after checking that it is not a file the command reads
+        setup_logging(None)
+        check_write_targets(kwargs)
+        setup_logging(kwargs.get("log_file"))
         log.info("run: treekit " + " ".join(sys.argv[1:]))
         func_tree = FuncTree(**kwargs)
 

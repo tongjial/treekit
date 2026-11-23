@@ -29,9 +29,9 @@ The options of commands are:
     summary     view trees summary
     taxa        view taxa summary
     remove      remove specific taxa/tips from trees
-    keep        (planned) pick-up the trees with specific taxa
+    keep        pick-up the trees with specific taxa
     mrca        (planned) check the monophyly or extract the clade based on given taxa/group
-    extract     (planned) generate subtrees only consist of the given taxa
+    extract     generate subtrees only consist of the given taxa
     prune       (planned) prune trees with specific branchlength
     root        (planned) root/reroot/unroot trees
     draw        (planned) display trees as textplot
@@ -76,6 +76,21 @@ The exit status is 0 on success, 1 on an error (bad input, nothing to do) and 2 
 * `--strict` turns the warning for absent taxa into an error.
 * A warning is given when trees are left with a single tip; the run stops if a tree would be left empty.
 * Trees that have tips without a label are rejected, because pruning would delete those tips too.
+
+### extract
+`treekit extract -n A B C -i trees.tre` keeps only the taxa A, B and C in every tree
+(or `-f names.txt`); the other tips are removed and branch lengths are merged. `-u nexus`
+writes nexus.
+
+* Taxa missing from some trees are noted in the log; taxa missing from all trees give one
+  warning (an error with `--strict`), and the run stops if none of them is found.
+* A tree that contains none of the requested taxa stops the run: select the trees first
+  with `treekit keep`. A warning is given for trees left with a single tip.
+
+### keep
+`treekit keep -n A B -i trees.tre` writes, unchanged and in input order, only the trees that
+contain **all** the taxa A and B (or `-f names.txt`). The log lists the kept trees. The run
+stops with an error if no tree contains all of them.
 
 ## Examples
 Sample data is in `examples/`:

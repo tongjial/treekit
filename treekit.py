@@ -14,9 +14,9 @@ COMMANDS = (
     ("summary", "view trees summary", "write_summaries"),
     ("taxa", "view taxa summary", "write_taxa_out"),
     ("remove", "remove specific taxa/tips from trees", "write_reduced_trees"),
-    ("keep", "pick-up the trees with specific taxa", None),
+    ("keep", "pick-up the trees with specific taxa", "write_kept_trees"),
     ("mrca", "check the monophyly or extract the clade based on given taxa/group", None),
-    ("extract", "generate subtrees only consist of the given taxa", None),
+    ("extract", "generate subtrees only consist of the given taxa", "write_extracted_trees"),
     ("prune", "prune trees with specific branchlength", None),
     ("root", "root/reroot/unroot trees", None),
     ("draw", "display trees as textplot", None),
@@ -258,6 +258,18 @@ class ParsedArgs:
         self.add_tree_out_args(parser)
         self.add_strict_arg(
             parser, "Exit with an error if a taxon to remove is absent from all trees.")
+
+    def extract(self, parser):
+
+        self.add_taxa_args(parser, "to keep in the subtrees")
+        self.add_tree_out_args(parser)
+        self.add_strict_arg(
+            parser, "Exit with an error if a taxon to extract is absent from all trees.")
+
+    def keep(self, parser):
+
+        self.add_taxa_args(parser, "that a tree must contain")
+        self.add_tree_out_args(parser)
 
     def get_args_dict(self):
 
@@ -739,20 +751,27 @@ class FuncTree:
                 single_tip_trees.append(index)
 
         # one summary line for all trees, instead of one line per tree
-        if single_tip_trees:
+        self.warn_single_tip_trees(single_tip_trees, "removing these taxa")
+        self.report_taxa_presence(taxa_to_remove, found, total, "to remove", "removed from")
+
+    def warn_single_tip_trees(self, tree_numbers, action):
+
+        # one warning for all the trees left with a single tip
+        if tree_numbers:
             log.warning(
-                "removing these taxa leaves %d tree(s) with a single tip (tree %s)"
-                % (len(single_tip_trees), ", ".join(map(str, single_tip_trees[:20])))
-                + (" ..." if len(single_tip_trees) > 20 else "")
+                "%s leaves %d tree(s) with a single tip (tree %s)"
+                % (action, len(tree_numbers), format_numbers(tree_numbers))
             )
 
-        # taxa absent from every tree: nothing would be removed
-        absent = [name for name in taxa_to_remove if found[name] == 0]
-        if absent and len(absent) == len(taxa_to_remove):
-            noun = "taxon" if len(taxa_to_remove) == 1 else "taxa"
+    def report_taxa_presence(self, names, found, total, purpose, done):
+
+        # taxa absent from every tree: nothing would be done with them
+        absent = [name for name in names if found[name] == 0]
+        if absent and len(absent) == len(names):
+            noun = "taxon" if len(names) == 1 else "taxa"
             raise TreekitError(
-                "none of the %d %s to remove were found in any input tree: %s"
-                % (len(taxa_to_remove), noun, ", ".join(absent))
+                "none of the %d %s %s were found in any input tree: %s"
+                % (len(names), noun, purpose, ", ".join(absent))
             )
 
         # one message for all absent taxa, instead of one line per taxon
@@ -764,17 +783,119 @@ class FuncTree:
                 raise TreekitError(message + " (--strict)")
             log.warning(message)
 
-        for name in taxa_to_remove:
+        for name in names:
             count = found[name]
             if 0 < count < total:
                 # partial presence is normal for sets of gene trees: log, do not warn
-                log.info("taxon '%s' removed from %d of %d trees" % (name, count, total))
+                log.info("taxon '%s' %s %d of %d trees" % (name, done, count, total))
             elif count == total:
-                log.info("taxon '%s' removed from all %d trees" % (name, total))
+                log.info("taxon '%s' %s all %d trees" % (name, done, total))
 
     def write_reduced_trees(self):
 
-        tree_list = self.get_reduced_trees()
+        self.write_trees(self.get_reduced_trees())
+
+    # methods corresponding to extract code block
+
+    def get_extracted_trees(self):
+
+        # keep only the requested taxa in every tree
+        tree_list = self.read_all_trees()
+        taxa_to_keep = self.get_requested_taxa("to extract")
+        wanted = set(taxa_to_keep)
+
+        # check every tree before anything is changed
+        found = Counter()
+        empty_trees = []
+        single_tip_trees = []
+        for index, tree in enumerate(tree_list, start=1):
+            present = wanted & self.tip_labels(tree)
+            found.update(present)
+            if not present:
+                empty_trees.append(index)
+            elif len(present) == 1:
+                single_tip_trees.append(index)
+
+        # taxa missing everywhere are reported first: that is the likely mistake
+        self.report_taxa_presence(
+            taxa_to_keep, found, len(tree_list), "to extract", "extracted from")
+        if empty_trees:
+            raise TreekitError(
+                "%d tree(s) contain none of the taxa to extract (tree %s); use "
+                "'treekit keep' first to select the trees that contain them"
+                % (len(empty_trees), format_numbers(empty_trees))
+            )
+        self.warn_single_tip_trees(single_tip_trees, "extracting these taxa")
+
+        # tips not asked for are removed, including tips without a label
+        for tree in tree_list:
+            tree.retain_taxa_with_labels(wanted)
+        self.drop_unused_taxa(tree_list)
+        return tree_list
+
+    def write_extracted_trees(self):
+
+        self.write_trees(self.get_extracted_trees())
+
+    # methods corresponding to keep code block
+
+    def get_kept_trees(self):
+
+        # select, unchanged, the trees that contain every requested taxon
+        tree_list = self.read_all_trees()
+        required = self.get_requested_taxa("that a tree must contain")
+        wanted = set(required)
+
+        found = Counter()
+        kept = new_tree_list(tree_list.taxon_namespace)
+        kept_numbers = []
+        for index, tree in enumerate(tree_list, start=1):
+            present = wanted & self.tip_labels(tree)
+            found.update(present)
+            if present == wanted:
+                kept.append(tree)
+                kept_numbers.append(index)
+
+        total = len(tree_list)
+        absent = [name for name in required if found[name] == 0]
+        if absent:
+            noun, verb = ("taxon", "is") if len(absent) == 1 else ("taxa", "are")
+            raise TreekitError(
+                "no tree can be kept: %d %s %s not in any input tree: %s"
+                % (len(absent), noun, verb, ", ".join(absent))
+            )
+        if not kept_numbers:
+            raise TreekitError(
+                "none of the %d input trees contains all %d requested taxa"
+                % (total, len(required))
+            )
+
+        for name in required:
+            log.info("taxon '%s' is in %d of %d trees" % (name, found[name], total))
+        log.info("kept %d of %d trees (tree %s)"
+                 % (len(kept_numbers), total, format_numbers(kept_numbers)))
+        self.drop_unused_taxa(kept)
+        return kept
+
+    def write_kept_trees(self):
+
+        self.write_trees(self.get_kept_trees())
+
+    # general methods for commands that write trees
+
+    def drop_unused_taxa(self, tree_list):
+
+        # do not declare, in nexus output, taxa that no output tree uses
+        used = set()
+        for tree in tree_list:
+            used |= self.tip_labels(tree)
+        taxon_namespace = tree_list.taxon_namespace
+        for taxon in list(taxon_namespace):
+            if taxon.label not in used:
+                taxon_namespace.remove_taxon(taxon)
+
+    def write_trees(self, tree_list):
+
         # keep quotes where labels need them, e.g. 'A(1)' or 'B,2'
         tree_out = tree_list.as_string(
             schema=self.out_format,
@@ -808,12 +929,18 @@ class FuncTree:
 
 # general functions for global invoking
 
-def new_tree_list():
+def new_tree_list(taxon_namespace=None):
 
-    # an empty tree list whose taxon namespace is case sensitive
-    return dendropy.TreeList(
+    # an empty tree list; a new taxon namespace is case sensitive
+    if taxon_namespace is None:
         taxon_namespace = dendropy.TaxonNamespace(is_case_sensitive = True)
-    )
+    return dendropy.TreeList(taxon_namespace = taxon_namespace)
+
+def format_numbers(numbers, limit=20):
+
+    # "1, 4, 7" for a short list; the first `limit` numbers and "..." otherwise
+    text = ", ".join(map(str, numbers[:limit]))
+    return text + (" ..." if len(numbers) > limit else "")
 
 def decimal_correct(m, n=9):
 

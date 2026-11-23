@@ -136,8 +136,24 @@ class TestCommandDispatch:
         assert "unrecognized command" in result.stderr
 
     def test_implemented_commands_are_registered(self):
-        assert set(treekit.IMPLEMENTED_COMMANDS) == {"summary", "taxa", "remove"}
+        assert {"summary", "taxa", "remove"} <= set(treekit.IMPLEMENTED_COMMANDS)
         assert not set(treekit.IMPLEMENTED_COMMANDS) & set(treekit.PLANNED_COMMANDS)
+        names = [name for name, _, _ in treekit.COMMANDS]
+        assert set(names) == set(treekit.IMPLEMENTED_COMMANDS) | set(treekit.PLANNED_COMMANDS)
+
+    def test_every_implemented_command_has_arguments_and_a_runner(self):
+        for name in treekit.IMPLEMENTED_COMMANDS:
+            assert callable(getattr(treekit.ParsedArgs, name)), name
+            assert callable(getattr(treekit.FuncTree, treekit.COMMAND_RUNNERS[name])), name
+
+    @pytest.mark.parametrize("name", [name for name, _, _ in treekit.COMMANDS])
+    def test_usage_lists_every_command(self, run, name):
+        result = run("-h")
+        assert result.returncode == 0
+        line = [l for l in result.stdout.splitlines() if l.strip().startswith(name + " ")]
+        assert len(line) == 1
+        planned = "(planned)" in line[0]
+        assert planned == (name in treekit.PLANNED_COMMANDS)
 
 
 # ---------------------------------------------------------------- fix 5: ultrametric check

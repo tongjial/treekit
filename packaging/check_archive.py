@@ -21,6 +21,13 @@ EXAMPLES = ROOT / "examples"
 NAME = re.compile(r"treekit-v(?P<version>.+)-(?P<system>linux|macos|windows)-(?P<arch>[^-]+)$")
 
 
+def stem_of(name):
+    for suffix in (".zip", ".tar.gz"):
+        if name.endswith(suffix):
+            return name[:-len(suffix)]
+    return None
+
+
 def fail(message):
     sys.exit("error: " + message)
 
@@ -31,14 +38,14 @@ def run(command, **kwargs):
 
 def main():
     release = Path(sys.argv[1] if len(sys.argv) > 1 else ROOT / "dist" / "release")
-    archives = sorted(p for p in release.iterdir() if p.name.endswith((".zip", ".tar.gz")))
+    # only treekit archives count: the folder may hold other files
+    archives = sorted(p for p in release.iterdir()
+                      if stem_of(p.name) and NAME.fullmatch(stem_of(p.name)))
     if len(archives) != 1:
-        fail("expected one archive in %s, found %s" % (release, [p.name for p in archives]))
+        fail("expected one treekit archive in %s, found %s" % (release, [p.name for p in archives]))
     archive = archives[0]
-    stem = archive.name[:-len(".zip")] if archive.name.endswith(".zip") else archive.name[:-len(".tar.gz")]
+    stem = stem_of(archive.name)
     match = NAME.fullmatch(stem)
-    if not match:
-        fail("unexpected archive name: " + archive.name)
     is_windows = match["system"] == "windows"
     if is_windows != archive.name.endswith(".zip"):
         fail("Windows archives are .zip, the others .tar.gz: " + archive.name)

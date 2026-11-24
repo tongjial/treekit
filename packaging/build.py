@@ -50,6 +50,20 @@ def platform_tag():
     return system, arch
 
 
+def clean_previous_output(dist, release):
+    # Remove only the files that an earlier run of this script wrote, by name, and
+    # never recursively: dist/ and dist/release may be linked to a shared folder, and
+    # shutil.rmtree would follow a linked parent and delete what belongs to others.
+    for pattern in ("treekit-v*.tar.gz", "treekit-v*.zip", "treekit-v*.sha256"):
+        for old in release.glob(pattern):
+            if old.is_file() or old.is_symlink():
+                old.unlink()
+    for name in ("treekit", "treekit.exe"):
+        old = dist / name
+        if old.is_file() or old.is_symlink():
+            old.unlink()
+
+
 def build_executable(exe_name):
     command = [
         sys.executable, "-m", "PyInstaller",
@@ -171,10 +185,7 @@ def main():
     name = "treekit-v%s-%s-%s" % (version, system, arch)
     print("building %s with Python %s" % (name, platform.python_version()), flush=True)
 
-    # only what this script writes: wheels or other files in dist/ are not touched
-    shutil.rmtree(RELEASE, ignore_errors=True)
-    (DIST / "treekit").unlink(missing_ok=True)
-    (DIST / "treekit.exe").unlink(missing_ok=True)
+    clean_previous_output(DIST, RELEASE)
     exe = build_executable("treekit.exe" if is_windows else "treekit")
 
     # the new executable must run at all, and report the version of the source

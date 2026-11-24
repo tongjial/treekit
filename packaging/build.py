@@ -171,7 +171,10 @@ def main():
     name = "treekit-v%s-%s-%s" % (version, system, arch)
     print("building %s with Python %s" % (name, platform.python_version()), flush=True)
 
-    shutil.rmtree(DIST, ignore_errors=True)
+    # only what this script writes: wheels or other files in dist/ are not touched
+    shutil.rmtree(RELEASE, ignore_errors=True)
+    (DIST / "treekit").unlink(missing_ok=True)
+    (DIST / "treekit.exe").unlink(missing_ok=True)
     exe = build_executable("treekit.exe" if is_windows else "treekit")
 
     # the new executable must run at all, and report the version of the source

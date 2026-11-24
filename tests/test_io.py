@@ -1,4 +1,5 @@
 import subprocess
+import sys
 
 import pytest
 
@@ -344,3 +345,34 @@ class TestNonAsciiNames:
         result = run("taxa", "-i", str(path), env=ASCII_DEFAULT)
         assert result.returncode == 1
         assert "is not valid UTF-8 text" in result.stderr
+
+
+@pytest.mark.skipif(sys.platform == "win32" or sys.platform == "darwin",
+                    reason="needs file names that are not valid text (Linux)")
+class TestFileNamesThatAreNotText:
+
+    def make(self, tmp_path):
+        import os
+        name = os.fsdecode(b"trees_\xe9.tre")          # surrogate escape for the byte e9
+        path = tmp_path / name
+        path.write_text("((A:1,B:1):1,C:1,D:1);\n")
+        return path
+
+    def test_summary_prints_the_name_instead_of_crashing(self, run, tmp_path):
+        path = self.make(tmp_path)
+        result = run("summary", "-i", str(path))
+        assert result.returncode == 0, result.stderr
+        assert "Traceback" not in result.stderr
+        assert "trees_\\udce9.tre" in result.stdout
+
+    def test_the_output_is_valid_utf8(self, tmp_path):
+        import subprocess
+        path = self.make(tmp_path)
+        out = subprocess.run([*TREEKIT_CMD, "summary", "-i", str(path)], capture_output=True)
+        assert out.returncode == 0
+        out.stdout.decode("utf-8")                     # raises if the bytes are not UTF-8
+
+    def test_an_error_message_with_such_a_name_does_not_crash(self, run, tmp_path):
+        result = run("remove", "-n", "A", "-i", str(tmp_path / "missing_\udce9.tre"))
+        assert result.returncode == 1
+        assert "Traceback" not in result.stderr

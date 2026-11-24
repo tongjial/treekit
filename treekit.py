@@ -2079,8 +2079,10 @@ def configure_streams():
 
     # results are UTF-8 on every platform: the default encoding of the Windows
     # console or of a pipe (cp1252, ...) would fail or garble non-ASCII taxon
-    # names, while files are written as UTF-8 already. Messages never fail.
-    for stream, errors in ((sys.stdout, "strict"), (sys.stderr, "replace")):
+    # names, while files are written as UTF-8 already. Nothing makes the output
+    # fail: what UTF-8 cannot hold, such as the bytes of a file name that is not
+    # valid text on Linux, is written as a visible escape (\udce9).
+    for stream, errors in ((sys.stdout, "backslashreplace"), (sys.stderr, "replace")):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is not None:
             reconfigure(encoding="utf-8", errors=errors)

@@ -1,10 +1,8 @@
 import subprocess
-import sys
-from pathlib import Path
 
 import pytest
 
-SCRIPT = Path(__file__).resolve().parent.parent / "treekit.py"
+from conftest import TREEKIT_CMD
 
 TREE = "((A:1,B:1):1,C:2);\n"
 MULTI = "((A:1,B:1):1,C:2);\n((A:1,C:1):1,D:2);\n((B:1,C:1):1,D:2);\n"
@@ -59,7 +57,7 @@ class TestStreams:
         # "treekit ... | head -n 1" must not print a BrokenPipeError traceback
         path = write("many.tre", "((A:1,B:1):1,C:2);\n" * 6000)
         proc = subprocess.Popen(
-            [sys.executable, str(SCRIPT), "summary", "-e", "-i", str(path)],
+            [*TREEKIT_CMD, "summary", "-e", "-i", str(path)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         proc.stdout.readline()
@@ -286,3 +284,58 @@ class TestLogOnAllCommands:
 def columns_of(result):
     lines = result.stdout.splitlines()
     return dict(zip(lines[0].split("\t"), lines[1].split("\t")))
+
+
+# ---------------------------------------------------------------- non-ASCII names, any default encoding
+
+# the default encoding of text files differs between systems (cp1252 on Windows);
+# these variables ask for an ASCII default on every system that honours them
+ASCII_DEFAULT = {"LC_ALL": "C", "PYTHONCOERCECLOCALE": "0", "PYTHONUTF8": "0",
+                 "PYTHONIOENCODING": ""}
+
+
+class TestNonAsciiNames:
+
+    NEWICK = "((Café_é:1,'Zoë b':1):1,C:1,D:1);\n"
+    NEXUS = ("#NEXUS\nBegin taxa;\nDimensions ntax=3;\nTaxlabels Café 'Zoë b' C;\nEnd;\n"
+             "Begin trees;\nTree t = ((Café:1,'Zoë b':1):1,C:1);\nEnd;\n")
+
+    @pytest.mark.parametrize("env", [None, ASCII_DEFAULT], ids=["default", "ascii-default"])
+    def test_newick_names_are_read_as_utf8(self, run, tmp_path, env):
+        path = tmp_path / "u.tre"
+        path.write_bytes(self.NEWICK.encode("utf-8"))
+        result = run("taxa", "-i", str(path), env=env)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.splitlines() == ["C", "Café_é", "D", "Zoë b"]
+
+    @pytest.mark.parametrize("env", [None, ASCII_DEFAULT], ids=["default", "ascii-default"])
+    def test_nexus_names_are_read_as_utf8(self, run, tmp_path, env):
+        path = tmp_path / "u.nex"
+        path.write_bytes(self.NEXUS.encode("utf-8"))
+        result = run("taxa", "-i", str(path), env=env)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.splitlines() == ["C", "Café", "Zoë b"]
+
+    @pytest.mark.parametrize("env", [None, ASCII_DEFAULT], ids=["default", "ascii-default"])
+    def test_names_survive_a_remove_round_trip(self, run, tmp_path, env):
+        path = tmp_path / "u.tre"
+        path.write_bytes(self.NEWICK.encode("utf-8"))
+        out = tmp_path / "out.tre"
+        result = run("remove", "-n", "D", "-o", str(out), "-i", str(path), env=env)
+        assert result.returncode == 0, result.stderr
+        assert out.read_bytes().decode("utf-8").strip() == \
+            "((Café_é:1.0,'Zoë b':1.0):1.0,C:1.0);"
+
+    def test_a_name_given_on_the_command_line(self, run, tmp_path):
+        path = tmp_path / "u.tre"
+        path.write_bytes(self.NEWICK.encode("utf-8"))
+        result = run("remove", "-n", "Café_é", "-i", str(path))
+        assert result.returncode == 0, result.stderr
+        assert "Café" not in result.stdout
+
+    def test_other_encodings_are_rejected_not_garbled(self, run, tmp_path):
+        path = tmp_path / "l1.tre"
+        path.write_bytes("((Café:1,B:1):1,C:1);\n".encode("latin-1"))
+        result = run("taxa", "-i", str(path), env=ASCII_DEFAULT)
+        assert result.returncode == 1
+        assert "is not valid UTF-8 text" in result.stderr

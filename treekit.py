@@ -8,6 +8,10 @@ import dendropy
 from dendropy.utility.error import DataParseError
 import statistics
 
+# the single source of the version: pyproject.toml reads it from here, and the
+# release workflow checks that it matches the tag
+__version__ = "0.1.0"
+
 # every subcommand: name, one-line help, and the FuncTree method that runs it;
 # the order is the order of the usage text. A method of None means "planned".
 COMMANDS = (
@@ -148,6 +152,12 @@ class ParsedArgs:
 
         # initialize the main ArgumentParser object
         parser = argparse.ArgumentParser(usage=usage_text())
+        parser.add_argument(
+            "-V",
+            "--version",
+            action = "version",
+            version = "treekit " + __version__
+        )
 
         # add the main argument "command"
         parser.add_argument(
@@ -586,15 +596,18 @@ class FuncTree:
         # parse one file; parser errors become treekit errors, not tracebacks.
         # labels are case sensitive: "a" and "A" are two taxa, and removing "a"
         # must not remove "A" (the dendropy default would merge them)
+        # the file is opened here, as UTF-8: DendroPy would use the default encoding of
+        # the system (cp1252 on Windows), which garbles or rejects non-ASCII names
         try:
             if tree_list is None:
                 tree_list = new_tree_list()
-            tree_list.read(
-                path = in_file,
-                schema = in_format,
-                case_sensitive_taxon_labels = True,
-                **kwargs
-            )
+            with open(in_file, "r", encoding="utf-8", newline=None) as handle:
+                tree_list.read(
+                    file = handle,
+                    schema = in_format,
+                    case_sensitive_taxon_labels = True,
+                    **kwargs
+                )
             return tree_list
         except DataParseError as err:
             raise TreekitError(
@@ -602,6 +615,8 @@ class FuncTree:
             )
         except UnicodeDecodeError:
             raise TreekitError("'%s' is not valid UTF-8 text" % in_file)
+        except OSError as err:
+            raise TreekitError("cannot read '%s': %s" % (in_file, err.strerror))
 
     def get_cores(self, cores):
 
@@ -2060,7 +2075,24 @@ def decimal_correct(m, n=9):
 
 # main function
 
+def configure_streams():
+
+    # results are UTF-8 on every platform: the default encoding of the Windows
+    # console or of a pipe (cp1252, ...) would fail or garble non-ASCII taxon
+    # names, while files are written as UTF-8 already. Messages never fail.
+    for stream, errors in ((sys.stdout, "strict"), (sys.stderr, "replace")):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors=errors)
+
 def main():
+
+    # needed when treekit is packaged into one executable (PyInstaller): on Windows
+    # and macOS the worker processes of -c are started by running that executable
+    # again, and this call makes them run as workers instead of as a new treekit.
+    # It does nothing in a normal run.
+    mp.freeze_support()
+    configure_streams()
 
     try:
         # initialize parsed arguments and FuncTree objects

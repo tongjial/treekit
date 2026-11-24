@@ -14,6 +14,19 @@ pip install .
 ```
 Or use `treekit.py` directly as a stand-alone script with `python3 treekit.py <command> ...`.
 
+### Download an executable (no Python needed)
+Every [release](https://github.com/tongjial/treekit/releases) has a single-file executable for
+Linux (x86_64, glibc 2.17 or newer), macOS (Apple Silicon and Intel) and Windows (x86_64). Each archive
+holds `treekit` (`treekit.exe` on Windows), the license, this README and the notices of the bundled software.
+```
+tar -xzf treekit-v0.1.0-linux-x86_64.tar.gz        # Windows: unzip the .zip
+./treekit-v0.1.0-linux-x86_64/treekit --version
+```
+Compare the checksum with the `.sha256` file of the release (`sha256sum -c`, `shasum -a 256 -c` on
+macOS, or `Get-FileHash` in PowerShell). The executables are not signed: on macOS run
+`xattr -d com.apple.quarantine treekit` once, on Windows choose "More info" and "Run anyway" in SmartScreen.
+The executable unpacks itself on every start, which takes about 0.2 s.
+
 ## Input
 Input files must be newick or nexus tree files, UTF-8 encoded and without a byte-order mark.
 Each file may hold one tree or many trees, and `-i` accepts several files (of either format),

@@ -1,0 +1,4 @@
+# Pinned, so that a release built from a tag always bundles the same versions.
+# Keep dendropy in step with the range in pyproject.toml.
+dendropy==5.1.3
+pyinstaller==6.22.3

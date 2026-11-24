@@ -106,11 +106,16 @@ class TestUnwritableOutput:
     @pytest.mark.parametrize("command", [
         ("remove", "-n", "A"), ("summary",), ("taxa",),
     ])
-    def test_unwritable_out_file_is_an_error(self, run, write, command):
+    def test_unwritable_out_file_is_an_error(self, run, write, tmp_path, command):
         path = write("a.tre", TREE)
-        result = run(*command, "-o", "/no/such/dir/out.txt", "-i", str(path))
+        # a folder that does not exist; the message shows the resolved path, which is
+        # not the literal argument on every system (/x is C:\\x on Windows)
+        target = tmp_path / "no" / "such" / "dir" / "out.txt"
+        result = run(*command, "-o", str(target), "-i", str(path))
         assert result.returncode == 1
-        assert "cannot write '/no/such/dir/out.txt'" in result.stderr
+        assert "treekit: error: cannot write '" in result.stderr
+        assert "out.txt" in result.stderr
+        assert not target.exists()
         no_traceback(result)
 
 

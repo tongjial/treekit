@@ -28,9 +28,7 @@ COMMANDS = (
     ("collapse", "collapse branches with low support into polytomies", "write_collapsed_trees"),
 )
 COMMAND_RUNNERS = {name: method for name, _, method in COMMANDS if method}
-# the commands whose output is trees
-TREE_WRITERS = ("write_reduced_trees", "write_kept_trees", "write_extracted_trees",
-                "write_rooted_trees", "write_pruned_trees", "write_collapsed_trees")
+
 IMPLEMENTED_COMMANDS = tuple(name for name, _, method in COMMANDS if method)
 PLANNED_COMMANDS = tuple(name for name, _, method in COMMANDS if not method)
 
@@ -50,10 +48,18 @@ class TreekitError(Exception):
 # relative/absolute tolerance for comparing leaf heights (ultrametric check)
 ULTRAMETRIC_TOL = 1e-9
 
-# a newick tree made of a single leaf, such as "A;" or "'A b':1.5;"
+# a newick tree made of a single leaf, such as "A;", "'A b':1.5;" or "A[&state=blue]:1;":
+# the label, then comments and a length in either order. A comment ends at the first
+# "]", as for the parser of the trees; a quoted label may hold brackets, so the label
+# is read first.
+_COMMENT = r"\[[^\]]*\]\s*"
 BARE_NEWICK = re.compile(
-    r"^('([^']|'')*'|[^\s()\[\]:;,'#]+)(:[-+0-9.eE]+)?\s*;"
+    r"^('([^']|'')*'|[^\s()\[\]:;,'#]+)\s*(?:%s)*(?::[-+0-9.eE]+\s*)?(?:%s)*;" % (_COMMENT, _COMMENT)
 )
+
+# annotations that describe a node, not the branch above it: they are only valid for
+# the clade of that node (BEAST: height, height_95%_HPD, ...; MrBayes: age_mean, ...)
+NODE_SCOPED_KEYS = ("height", "age")
 
 # warnings and errors go to stderr; with --log, info lines also go to a log file
 log = logging.getLogger("treekit")
@@ -596,6 +602,10 @@ class FuncTree:
         # parse one file; parser errors become treekit errors, not tracebacks.
         # labels are case sensitive: "a" and "A" are two taxa, and removing "a"
         # must not remove "A" (the dendropy default would merge them)
+        # comments such as [&posterior=0.98,note="red, blue"] stay text, exactly as
+        # written: DendroPy's parser of their contents cuts quoted values at a comma
+        kwargs.setdefault("extract_comment_metadata", False)
+
         # the file is opened here, as UTF-8: DendroPy would use the default encoding of
         # the system (cp1252 on Windows), which garbles or rejects non-ASCII names
         try:
@@ -832,10 +842,6 @@ class FuncTree:
     # methods corresponding to taxa code block
 
     def read_all_trees(self, **kwargs):
-
-        # commands that write trees keep comments such as [&posterior=0.98]
-        if COMMAND_RUNNERS.get(self.command) in TREE_WRITERS:
-            kwargs.setdefault("extract_comment_metadata", True)
 
         # every file is parsed on its own, because a NEXUS file declares the number
         # of its taxa and cannot be read into a namespace already filled by another
@@ -1105,15 +1111,23 @@ class FuncTree:
         tree_list = self.read_all_trees()
         total = len(tree_list)
 
-        conflicts = []
         clash_trees = []
+        dropped_trees = []
+
+        def reroot(index, tree, operation):
+            conflicts, dropped = [], []
+            result = keep_split_labels(tree, operation, conflicts, dropped)
+            if conflicts:
+                clash_trees.append(index)
+            if dropped:
+                dropped_trees.append(index)
+            return result
 
         if self.options.get("unroot"):
             for index, tree in enumerate(tree_list, start=1):
-                if keep_split_labels(tree, unroot_tree, conflicts) is None and conflicts:
-                    clash_trees.append(index)
-                    conflicts.clear()
+                reroot(index, tree, unroot_tree)
             self.warn_label_clashes(clash_trees)
+            self.warn_dropped_heights(dropped_trees)
             log.info("unrooted %d trees" % total)
             return tree_list
 
@@ -1134,13 +1148,11 @@ class FuncTree:
         # the number and the order of the input trees
         failed = {}
         for index, tree in enumerate(tree_list, start=1):
-            reason = keep_split_labels(tree, root_one, conflicts)
+            reason = reroot(index, tree, root_one)
             if reason is not None and reason != UNCHANGED:
                 failed.setdefault(reason, []).append(index)
-            if conflicts:
-                clash_trees.append(index)
-                conflicts.clear()
         self.warn_label_clashes(clash_trees)
+        self.warn_dropped_heights(dropped_trees)
 
         for reason, numbers in failed.items():
             message = "%d tree(s) cannot be rooted (%s): tree %s" % (
@@ -1156,9 +1168,17 @@ class FuncTree:
 
         if tree_numbers:
             log.warning(
-                "%d tree(s) had different labels on the two branches at the old root, "
-                "which became one branch; the label of the first branch was kept: tree %s"
+                "%d tree(s) had different labels or annotations on the two branches at the "
+                "old root, which became one branch; the first value of each was kept: tree %s"
                 % (len(tree_numbers), format_numbers(tree_numbers)))
+
+    def warn_dropped_heights(self, tree_numbers):
+
+        if tree_numbers:
+            log.warning(
+                "%d tree(s) had node annotations of heights or ages (height, height_*, age, "
+                "age_*) on nodes whose clade changed with the root; they were removed, not "
+                "moved to other nodes: tree %s" % (len(tree_numbers), format_numbers(tree_numbers)))
 
     def write_rooted_trees(self):
 
@@ -1596,12 +1616,12 @@ class FuncTree:
 
         # keep quotes where labels need them, e.g. 'A(1)' or 'B,2'
         # labels with spaces are quoted, not turned into underscores ('A B' and
-        # A_B are two taxa); comments such as [&posterior=0.98] are written back
+        # A_B are two taxa); comments such as [&posterior=0.98] are written back as read
         tree_out = tree_list.as_string(
             schema=self.out_format,
             unquoted_underscores=True,
             preserve_spaces=True,
-            suppress_annotations=False
+            suppress_item_comments=False
         )
         self.emit(tree_out, "trees")
 
@@ -1667,46 +1687,90 @@ def split_key(mask, full):
 # returned by a rooting operation that left the tree exactly as it was
 UNCHANGED = "unchanged"
 
-def keep_split_labels(tree, operation, conflicts=None):
+def keep_split_labels(tree, operation, conflicts=None, dropped=None):
 
-    # node labels and annotations (e.g. branch supports) belong to the split of
-    # the branch above the node; rerooting moves nodes, so they are put back by
-    # split afterwards. The operation returns None when it changed the tree,
-    # UNCHANGED when it did not, or the reason why it could not (the tree is then
-    # untouched); only a changed tree gets its labels re-assigned.
+    # Node labels and comments (branch supports, rates, heights, ...) are attached to
+    # nodes, and rerooting moves nodes, so they are put back after the operation:
+    # * what describes the branch above a node (labels and every comment item except
+    #   heights and ages) belongs to the split of that branch and follows it;
+    # * what describes the node itself (heights and ages, NODE_SCOPED_KEYS) belongs
+    #   to its clade: it stays on a node whose tips below it are unchanged and is
+    #   removed otherwise; it is never copied onto another node.
+    # The comments are moved as text, exactly as written.
+    # The operation returns None when it changed the tree, UNCHANGED when it did not,
+    # or the reason why it could not (the tree is then untouched); only a changed
+    # tree gets its metadata re-assigned.
     bits = leaf_bit_map(tree)
     full = (1 << len(bits)) - 1
-    saved = {}
+    branches = {}       # split -> {"label", "items": [(key, text)], "texts": [free text]}
+    clades = {}         # tips below a node -> its node-scoped items
+    nodes_with_heights = 0
     clash = False
     for node, mask in node_masks(tree, bits).items():
-        if not node.is_internal() or node is tree.seed_node:
+        if not node.is_internal():
             continue
-        data = (node.label, [(a.name, a.value) for a in node.annotations])
-        if data == (None, []):
+        items, texts, node_items = [], [], []
+        for comment in node.comments:
+            parts = split_comment(comment)
+            if parts is None:
+                texts.append(comment)
+                continue
+            for part in parts:
+                (node_items if is_node_scoped(comment_key(part)) else items).append(part)
+        if node_items:
+            nodes_with_heights += 1
+        if node is tree.seed_node:
+            continue                      # the root has no branch above it
+        if node_items:
+            clades[mask] = node_items
+        if node.label is None and not items and not texts:
             continue
-        key = split_key(mask, full)
-        # the two branches at a bifurcating root are one split: if they carry
-        # different labels, only the first can be kept when they become one branch
-        if key in saved:
-            clash = clash or saved[key] != data
-            continue
-        saved[key] = data
+
+        # the two branches at a bifurcating root are one split: when they become one
+        # branch their data is combined; a label or a key with another value on the
+        # second branch cannot be kept
+        entry = branches.setdefault(
+            split_key(mask, full), {"label": None, "items": [], "texts": [], "merged": False})
+        if node.label is not None:
+            if entry["label"] is None:
+                entry["label"] = node.label
+            elif entry["label"] != node.label:
+                clash = True
+        earlier = dict(entry["items"]) if entry["merged"] else {}
+        for part in items:
+            key = comment_key(part)
+            if key not in earlier:
+                entry["items"].append((key, part))
+            elif earlier[key] != part:
+                clash = True
+        entry["texts"].extend(text for text in texts if text not in entry["texts"])
+        entry["merged"] = True
 
     result = operation(tree)
     if result is not None:
         return result
 
+    kept_heights = 0
     for node, mask in node_masks(tree, bits).items():
         if not node.is_internal():
             continue
-        label, annotations = (None, []) if node is tree.seed_node else \
-            saved.get(split_key(mask, full), (None, []))
+        label, parts, texts = None, [], []
+        if node is not tree.seed_node:
+            entry = branches.get(split_key(mask, full))
+            if entry:
+                label = entry["label"]
+                parts = [text for _, text in entry["items"]]
+                texts = entry["texts"]
+            if mask in clades:
+                parts = parts + clades[mask]
+                kept_heights += 1
         node.label = label
-        node.annotations.clear()
-        for name, value in annotations:
-            node.annotations.add_new(name, value)
+        # one comment of items, then any free text, like the usual layout of BEAST trees
+        node.comments[:] = (["&" + ",".join(parts)] if parts else []) + list(texts)
     if clash and conflicts is not None:
         conflicts.append(True)
+    if dropped is not None and nodes_with_heights > kept_heights:
+        dropped.append(nodes_with_heights - kept_heights)
     return None
 
 def unroot_tree(tree):
@@ -1751,6 +1815,9 @@ def root_on_outgroup(tree, outgroup):
     # the outgroup must be one side of a split: a clade, or the complement of one.
     # This is checked before the tree is changed, so a failure leaves it intact.
     def outgroup_branch():
+        # the node nearest to the root whose branch separates the outgroup: nodes with
+        # a single child repeat the split of the node below them, and the upper one
+        # is taken, so that a root already on the split is recognised
         out_below = {}
         all_below = {}
         for node in tree.postorder_node_iter():
@@ -1760,7 +1827,7 @@ def root_on_outgroup(tree, outgroup):
             else:
                 out_below[node] = sum(out_below[c] for c in node.child_node_iter())
                 all_below[node] = sum(all_below[c] for c in node.child_node_iter())
-        for node in tree.postorder_node_iter():
+        for node in tree.preorder_node_iter():
             if node is tree.seed_node:
                 continue
             if out_below[node] == n_out == all_below[node] or \
@@ -1784,20 +1851,10 @@ def root_on_outgroup(tree, outgroup):
     root_on_edge(tree, node.edge, None if length is None else float(length) / 2)
     return None
 
-def root_at_midpoint(tree):
+def longest_tip_path(tree):
 
-    # returns None when rooted, or the reason why the tree cannot be rooted;
-    # every reason is found before the tree is changed
-    edges = [node.edge for node in tree.preorder_node_iter() if node is not tree.seed_node]
-    if not edges:
-        return "the tree has a single tip"
-    if any(edge.length is None for edge in edges):
-        return "midpoint rooting needs branch lengths"
-    if not any(float(edge.length) > 0 for edge in edges):
-        return "all branch lengths are zero"
-    unroot_tree(tree)
-
-    # neighbours of every node with the length of the branch between them
+    # (length, tip b, distance from tip a, previous node) of the longest path between
+    # two tips: the farthest tip from any tip is one end, the farthest from it the other
     neighbours = {node: [] for node in tree.preorder_node_iter()}
     for node in tree.preorder_node_iter():
         if node is not tree.seed_node:
@@ -1820,10 +1877,36 @@ def root_at_midpoint(tree):
         far = max(tips, key=lambda n: distance[n])
         return far, distance, previous
 
-    # the longest tip-to-tip path: farthest tip from any tip, then farthest from it
     a, _, _ = farthest_tip(next(tree.leaf_node_iter()))
     b, distance, previous = farthest_tip(a)
-    diameter = distance[b]
+    return distance[b], b, distance, previous
+
+def root_at_midpoint(tree):
+
+    # returns None when rooted, UNCHANGED when it already was, or the reason why the
+    # tree cannot be rooted; every reason is found before the tree is changed
+    edges = [node.edge for node in tree.preorder_node_iter() if node is not tree.seed_node]
+    if not edges:
+        return "the tree has a single tip"
+    if any(edge.length is None for edge in edges):
+        return "midpoint rooting needs branch lengths"
+    if not any(float(edge.length) > 0 for edge in edges):
+        return "all branch lengths are zero"
+
+    # a tree already rooted at its midpoint is kept as it is, with everything on its
+    # nodes: the farthest tips of the two sides of the root are equally far from it,
+    # and the longest path of the tree goes through the root (a time tree)
+    root_children = tree.seed_node.child_nodes()
+    if len(root_children) == 2:
+        depths = [max(leaf.distance_from_root() for leaf in child.leaf_iter())
+                  for child in root_children]
+        close = lambda x, y: math.isclose(x, y, rel_tol=ULTRAMETRIC_TOL, abs_tol=ULTRAMETRIC_TOL)
+        if close(depths[0], depths[1]) and close(sum(depths), longest_tip_path(tree)[0]):
+            tree.is_rooted = True
+            return UNCHANGED
+
+    unroot_tree(tree)
+    diameter, b, distance, previous = longest_tip_path(tree)
     if diameter <= 0:
         return "all branch lengths are zero"
     half = diameter / 2.0
@@ -2033,15 +2116,53 @@ def clear_stem(tree):
     # that is not a branch of the tree (it would count in the tree length)
     tree.seed_node.edge.length = None
 
+def split_comment(comment):
+
+    # the items of a comment such as '&posterior=0.4,note="red, blue",h={1,2}', as
+    # written; None for a comment that is not a list of items. Commas inside quotes
+    # or braces do not separate items.
+    if not comment.startswith("&"):
+        return None
+    items, current, depth, quoted = [], [], 0, False
+    for char in comment[1:]:
+        if char == '"':
+            quoted = not quoted
+        elif not quoted and char == "{":
+            depth += 1
+        elif not quoted and char == "}":
+            depth = max(depth - 1, 0)
+        elif not quoted and depth == 0 and char == ",":
+            items.append("".join(current).strip())
+            current = []
+            continue
+        current.append(char)
+    items.append("".join(current).strip())
+    return [item for item in items if item]
+
+def comment_key(item):
+
+    return item.partition("=")[0].strip()
+
+def is_node_scoped(key):
+
+    return any(key == name or key.startswith(name + "_") for name in NODE_SCOPED_KEYS)
+
+def comment_value(comments, key):
+
+    # the value of the item `key` in a list of comments, as text; None if there is none
+    for comment in comments:
+        for item in split_comment(comment) or []:
+            name, _, value = item.partition("=")
+            if name.strip() == key:
+                return value.strip().strip('"')
+    return None
+
 def node_support_text(node, key=None):
 
-    # the raw support of the branch above node: an annotation, or the node label
+    # the raw support of the branch above node: an item of its comments, or the node label
     if key is None:
         return node.label
-    for annotation in node.annotations:
-        if annotation.name == key:
-            return annotation.value
-    return None
+    return comment_value(list(node.comments) + list(node.edge.comments), key)
 
 def parse_support(text, field=None):
 

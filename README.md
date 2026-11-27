@@ -32,7 +32,8 @@ Input files must be newick or nexus tree files, UTF-8 encoded and without a byte
 Each file may hold one tree or many trees, and `-i` accepts several files (of either format),
 relative or absolute paths, and shell-style wildcards (for example `-i "trees/*.tre"`).
 Taxon labels are case sensitive: `a` and `A` are two taxa. Labels with spaces are written quoted
-(`'A b'`), and comments such as `[&posterior=0.98]` are kept in the trees that commands write.
+(`'A b'`). Comments such as `[&posterior=0.98,note="red, blue"]` are kept in the trees that commands
+write, exactly as written. A file may hold a single tip with comments (`A[&state=blue];`).
 
 ## Commands
 usage:
@@ -115,15 +116,20 @@ Exactly one of:
   ones it has. A tree already rooted between the outgroup and the rest is kept as it is, so time
   trees stay ultrametric.
 * `treekit root --midpoint -i trees.tre` roots every tree halfway along its longest tip-to-tip path
-  (needs branch lengths). An ultrametric tree keeps its root.
+  (needs branch lengths). A tree that is already rooted at its midpoint, such as a time tree, is
+  kept as it is, with everything on its nodes.
 * `treekit root --unroot -i trees.tre` removes the root, merging the two root branches.
 
 A tree that cannot be rooted (no outgroup taxon, an outgroup that is not monophyletic, no branch
 lengths for `--midpoint`) is written unchanged, so the output has the same trees in the same order
 as the input; one warning per reason lists the trees. `--strict` makes this an error.
-Node labels and comments such as branch supports stay on their branch when the root moves. If the two
-branches at an old root carry different labels, they become one branch with the first label (a warning
-lists the trees).
+When the root moves, what describes a branch stays on that branch: node labels and the items of the
+comments such as `posterior`, `rate` or `length` follow the split. What describes a node itself, the items
+`height`, `height_*`, `age` and `age_*` (BEAST, MrBayes), is only valid for the tips below that node: it
+stays on a node whose tips are unchanged and is removed from the others, never moved to another node
+(a warning lists the trees). The two branches at an old root become one branch: their labels and items
+are combined, and when both have a label or an item of the same name with different values, the first
+one is kept (a warning lists the trees).
 
 ### mrca
 `treekit mrca -n A B C -i trees.tre` tests whether the group A, B, C is monophyletic in every

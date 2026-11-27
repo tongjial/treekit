@@ -186,9 +186,9 @@ class TestUnmovedRootKeepsLabels:
         path = write("l.tre", "[&R] ((A:1,B:1)90:1,(C:1,D:1)70:2);\n")
         result = run("root", "-n", "A", "-i", str(path))
         assert result.returncode == 0
-        assert "different labels on the two branches at the old root" in result.stderr
+        assert "different labels or annotations on the two branches at the old root" in result.stderr
         unrooted = run("root", "--unroot", "-i", str(path))
-        assert "different labels on the two branches at the old root" in unrooted.stderr
+        assert "different labels or annotations on the two branches at the old root" in unrooted.stderr
 
     def test_equal_labels_at_the_old_root_are_not_reported(self, run, write):
         path = write("l.tre", "[&R] ((A:1,B:1)90:1,(C:1,D:1)90:2);\n")

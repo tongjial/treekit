@@ -362,3 +362,131 @@ class TestCommentHelpers:
     ])
     def test_is_node_scoped(self, key, expected):
         assert treekit.is_node_scoped(key) is expected
+
+
+# ---------------------------------------------------------------- 4 (again). nodes with the same tips
+
+class TestHeightsOnNodesWithTheSameTips:
+
+    CHAIN = "(((A:1,B:1)[&height=1]:1)[&height=2]:1,C:3,D:3,E:3);\n"
+
+    def test_a_surviving_node_keeps_its_own_height(self, run, write):
+        # a node with one child and its child have the same tips; DendroPy removes the
+        # upper one while rerooting, and the node that stays must keep height=1
+        path = write("c.tre", self.CHAIN)
+        result = run("root", "-n", "E", "-i", str(path))
+        assert result.returncode == 0, result.stderr
+        assert "height=1" in result.stdout and "height=2" not in result.stdout
+        tree = read(result.stdout.strip())[0]
+        assert branch_data(tree, "AB")[1] == ["height=1"]
+        # the height of the node that is gone is reported as removed
+        assert "node annotations of heights or ages" in result.stderr
+
+    def test_unrooting_keeps_each_height_on_its_own_node(self, run, write):
+        # the chain stays after unrooting: both nodes keep their own height. The node of
+        # (C, D) is merged into the root, so its height is removed.
+        path = write("c.tre", "[&R] (((A:1,B:1)[&height=1]:1)[&height=2]:1,(C:3,D:3)[&height=3]:1);\n")
+        result = run("root", "--unroot", "-i", str(path))
+        assert result.returncode == 0, result.stderr
+        assert "(A:1.0,B:1.0):1.0[&height=1]" in result.stdout     # the lower node of the chain
+        assert "[&height=2]" in result.stdout                      # the upper node
+        assert "height=3" not in result.stdout
+        assert "node annotations of heights or ages" in result.stderr
+
+    def test_two_nodes_with_the_same_tips_and_a_third_that_stays(self, run, write):
+        path = write("c.tre", "(((A:1,B:1)[&height=1]:1)[&height=2]:1,(C:3,D:3)[&height=3]:1,E:5);\n")
+        result = run("root", "-n", "E", "-i", str(path))
+        assert result.returncode == 0, result.stderr
+        tree = read(result.stdout.strip())[0]
+        assert branch_data(tree, "AB")[1] == ["height=1"]
+        assert branch_data(tree, "CD")[1] == ["height=3"]
+        assert "height=2" not in result.stdout
+
+    def test_on_a_time_tree_with_a_unary_node_above_every_second_node(self, run, tmp_path):
+        # every unary node gets a height of its own that no other node has (negative):
+        # rooting removes the unary nodes, and no height may end up on another node
+        source = read(MCC, "nexus")[0]
+        original = node_scoped(read(MCC, "nexus")[0])
+        inner = [n for n in source.postorder_internal_node_iter()
+                 if n is not source.seed_node and n.edge.length]
+        for index, node in enumerate(inner[::2]):
+            parent = node.parent_node
+            unary = type(node)()
+            unary.edge.length = node.edge.length / 2
+            node.edge.length = node.edge.length / 2
+            unary.comments.append("&height=%s" % (-1.0 - index))
+            position = parent.child_nodes().index(node)
+            parent.remove_child(node)
+            parent.insert_child(position, unary)
+            unary.add_child(node)
+        path = tmp_path / "unary.tre"
+        path.write_text(source.as_string(schema="newick", suppress_item_comments=False,
+                                         unquoted_underscores=True) + "\n")
+        assert path.read_text().count("height=-") == len(inner[::2]) > 30   # the unary nodes are there
+
+        out = tmp_path / "rooted.tre"
+        result = run("root", "-n", "Coris_monspeliensis_Y925", "-o", str(out), "-i", str(path))
+        assert result.returncode == 0, result.stderr
+        assert "height=-" not in out.read_text()
+        after = node_scoped(read(out)[0])
+        assert len(after) > 100
+        # every height left is a height of the original tree, on the clade it belonged to
+        assert set(after.items()) <= set(original.items())
+
+
+# ---------------------------------------------------------------- 6. NHX comments
+
+class TestNhxComments:
+
+    NHX = "((A:1,B:1)[&&NHX:B=40]:1,(C:1,D:1)[&&NHX:B=99]:1,E:1);\n"
+    NHX2 = ("((A:1,B:1)[&&NHX:S=human:B=40:E=1.1]:1,(C:1,D:1)[&&NHX:S=mouse:B=99]:1,E:1);\n")
+
+    def test_collapse_reads_the_support_of_an_nhx_comment(self, run, write):
+        path = write("n.tre", self.NHX)
+        result = run("collapse", "-m", "95", "--support-key", "B", "-i", str(path))
+        assert result.returncode == 0, result.stderr
+        assert result.stderr == ""
+        assert result.stdout.strip() == "(A:2.0,B:2.0,(C:1.0,D:1.0):1.0[&&NHX:B=99],E:1.0);"
+
+    def test_collapse_with_several_fields(self, run, write):
+        path = write("n.tre", self.NHX2)
+        result = run("collapse", "-m", "95", "--support-key", "B", "-i", str(path))
+        assert result.stderr == ""
+        assert "&&NHX:S=mouse:B=99" in result.stdout and "human" not in result.stdout
+
+    def test_other_keys_of_an_nhx_comment_can_be_the_support(self, run, write):
+        path = write("n.tre", self.NHX2)
+        result = run("collapse", "-m", "1.5", "--support-key", "E", "-i", str(path))
+        # E=1.1 is the only value of its key: collapsed; the other branch has no E
+        assert "human" not in result.stdout
+
+    def test_nhx_comments_are_written_as_read(self, run, write):
+        path = write("n.tre", self.NHX2)
+        result = run("keep", "-n", "A", "-i", str(path))
+        assert "[&&NHX:S=human:B=40:E=1.1]" in result.stdout
+        assert "[&&NHX:S=mouse:B=99]" in result.stdout
+
+    @pytest.mark.parametrize("outgroup", ["A", "E", "C"])
+    def test_rerooting_keeps_the_nhx_format_and_all_fields(self, run, write, outgroup):
+        path = write("n.tre", self.NHX2)
+        result = run("root", "-n", outgroup, "-i", str(path))
+        assert result.returncode == 0, result.stderr
+        tree = read(result.stdout.strip())[0]
+        comments = sorted(c for n in tree.postorder_internal_node_iter() for c in n.comments)
+        assert comments == ["&&NHX:S=human:B=40:E=1.1", "&&NHX:S=mouse:B=99"]
+
+    def test_both_styles_on_one_node_stay_two_comments(self, run, write):
+        path = write("n.tre", "((A:1,B:1)[&&NHX:B=40][&posterior=0.9]:1,(C:1,D:1):1,E:1);\n")
+        result = run("root", "-n", "E", "-i", str(path))
+        assert result.returncode == 0, result.stderr
+        tree = read(result.stdout.strip())[0]
+        comments = sorted(c for n in tree.postorder_internal_node_iter() for c in n.comments)
+        assert comments == ["&&NHX:B=40", "&posterior=0.9"]
+
+    def test_helpers(self):
+        assert treekit.split_comment("&&NHX:S=human:B=40") == ["S=human", "B=40"]
+        assert treekit.comment_style("&&NHX:B=1") == "nhx" and treekit.comment_style("&B=1") == "beast"
+        assert treekit.comment_value(["&&NHX:S=human:B=40"], "B") == "40"
+        assert treekit.join_items([("nhx", "B=40"), ("beast", "p=1"), ("nhx", "S=x"), ("beast", "q=2")]) == \
+            ["&&NHX:B=40:S=x", "&p=1,q=2"]
+        assert treekit.join_items([]) == []

@@ -1177,8 +1177,9 @@ class FuncTree:
         if tree_numbers:
             log.warning(
                 "%d tree(s) had node annotations of heights or ages (height, height_*, age, "
-                "age_*) on nodes whose clade changed with the root; they were removed, not "
-                "moved to other nodes: tree %s" % (len(tree_numbers), format_numbers(tree_numbers)))
+                "age_*) on nodes that are gone or whose tips changed with the root; they were "
+                "removed, not moved to other nodes: tree %s"
+                % (len(tree_numbers), format_numbers(tree_numbers)))
 
     def write_rooted_trees(self):
 
@@ -1694,16 +1695,16 @@ def keep_split_labels(tree, operation, conflicts=None, dropped=None):
     # * what describes the branch above a node (labels and every comment item except
     #   heights and ages) belongs to the split of that branch and follows it;
     # * what describes the node itself (heights and ages, NODE_SCOPED_KEYS) belongs
-    #   to its clade: it stays on a node whose tips below it are unchanged and is
-    #   removed otherwise; it is never copied onto another node.
+    #   to that node: it stays on a node that is still there with the same tips
+    #   below it, and is removed otherwise; it is never copied onto another node.
     # The comments are moved as text, exactly as written.
     # The operation returns None when it changed the tree, UNCHANGED when it did not,
     # or the reason why it could not (the tree is then untouched); only a changed
     # tree gets its metadata re-assigned.
     bits = leaf_bit_map(tree)
     full = (1 << len(bits)) - 1
-    branches = {}       # split -> {"label", "items": [(key, text)], "texts": [free text]}
-    clades = {}         # tips below a node -> its node-scoped items
+    branches = {}       # split -> {"label", "items": [(style, text)], "texts": [free text]}
+    own_items = {}      # node -> (tips below it, its node-scoped (style, text) items)
     nodes_with_heights = 0
     clash = False
     for node, mask in node_masks(tree, bits).items():
@@ -1715,14 +1716,15 @@ def keep_split_labels(tree, operation, conflicts=None, dropped=None):
             if parts is None:
                 texts.append(comment)
                 continue
+            style = comment_style(comment)
             for part in parts:
-                (node_items if is_node_scoped(comment_key(part)) else items).append(part)
+                (node_items if is_node_scoped(comment_key(part)) else items).append((style, part))
         if node_items:
             nodes_with_heights += 1
         if node is tree.seed_node:
             continue                      # the root has no branch above it
         if node_items:
-            clades[mask] = node_items
+            own_items[node] = (mask, node_items)
         if node.label is None and not items and not texts:
             continue
 
@@ -1736,12 +1738,13 @@ def keep_split_labels(tree, operation, conflicts=None, dropped=None):
                 entry["label"] = node.label
             elif entry["label"] != node.label:
                 clash = True
-        earlier = dict(entry["items"]) if entry["merged"] else {}
-        for part in items:
-            key = comment_key(part)
+        earlier = {(style, comment_key(text)): text for style, text in entry["items"]} \
+            if entry["merged"] else {}
+        for style, text in items:
+            key = (style, comment_key(text))
             if key not in earlier:
-                entry["items"].append((key, part))
-            elif earlier[key] != part:
+                entry["items"].append((style, text))
+            elif earlier[key] != text:
                 clash = True
         entry["texts"].extend(text for text in texts if text not in entry["texts"])
         entry["merged"] = True
@@ -1759,14 +1762,15 @@ def keep_split_labels(tree, operation, conflicts=None, dropped=None):
             entry = branches.get(split_key(mask, full))
             if entry:
                 label = entry["label"]
-                parts = [text for _, text in entry["items"]]
+                parts = list(entry["items"])
                 texts = entry["texts"]
-            if mask in clades:
-                parts = parts + clades[mask]
+            # a node keeps its own heights only if the tips below it are the same
+            if node in own_items and own_items[node][0] == mask:
+                parts += own_items[node][1]
                 kept_heights += 1
         node.label = label
-        # one comment of items, then any free text, like the usual layout of BEAST trees
-        node.comments[:] = (["&" + ",".join(parts)] if parts else []) + list(texts)
+        # comments of items, one per style, then any free text
+        node.comments[:] = join_items(parts) + list(texts)
     if clash and conflicts is not None:
         conflicts.append(True)
     if dropped is not None and nodes_with_heights > kept_heights:
@@ -2116,11 +2120,30 @@ def clear_stem(tree):
     # that is not a branch of the tree (it would count in the tree length)
     tree.seed_node.edge.length = None
 
+NHX_PREFIX = "&&NHX:"
+
+def comment_style(comment):
+
+    # NHX comments are "&&NHX:B=40:S=human", the others "&posterior=0.4,rate=1.1"
+    return "nhx" if comment.startswith(NHX_PREFIX) else "beast"
+
+def join_items(items):
+
+    # comments for (style, text) items: one per style, in the order the styles appear
+    comments = []
+    for style in dict.fromkeys(style for style, _ in items):
+        texts = [text for kind, text in items if kind == style]
+        comments.append(NHX_PREFIX + ":".join(texts) if style == "nhx"
+                        else "&" + ",".join(texts))
+    return comments
+
 def split_comment(comment):
 
-    # the items of a comment such as '&posterior=0.4,note="red, blue",h={1,2}', as
-    # written; None for a comment that is not a list of items. Commas inside quotes
-    # or braces do not separate items.
+    # the items of a comment such as '&posterior=0.4,note="red, blue",h={1,2}' or
+    # '&&NHX:B=40:S=human', as written; None for a comment that is not a list of
+    # items. Commas inside quotes or braces do not separate items.
+    if comment.startswith(NHX_PREFIX):
+        return [part.strip() for part in comment[len(NHX_PREFIX):].split(":") if part.strip()]
     if not comment.startswith("&"):
         return None
     items, current, depth, quoted = [], [], 0, False

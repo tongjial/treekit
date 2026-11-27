@@ -10,7 +10,7 @@ import statistics
 
 # the single source of the version: pyproject.toml reads it from here, and the
 # release workflow checks that it matches the tag
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # every subcommand: name, one-line help, and the FuncTree method that runs it;
 # the order is the order of the usage text. A method of None means "planned".

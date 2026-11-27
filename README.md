@@ -19,8 +19,8 @@ Every [release](https://github.com/tongjial/treekit/releases) has a single-file 
 Linux (x86_64, glibc 2.17 or newer), macOS (Apple Silicon and Intel) and Windows (x86_64). Each archive
 holds `treekit` (`treekit.exe` on Windows), the license, this README and the notices of the bundled software.
 ```
-tar -xzf treekit-v0.1.0-linux-x86_64.tar.gz        # Windows: unzip the .zip
-./treekit-v0.1.0-linux-x86_64/treekit --version
+tar -xzf treekit-v0.1.1-linux-x86_64.tar.gz        # Windows: unzip the .zip
+./treekit-v0.1.1-linux-x86_64/treekit --version
 ```
 Compare the checksum with the `.sha256` file of the release (`sha256sum -c`, `shasum -a 256 -c` on
 macOS, or `Get-FileHash` in PowerShell). The executables are not signed: on macOS run

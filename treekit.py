@@ -1739,15 +1739,16 @@ def keep_split_labels(tree, operation, conflicts=None, dropped=None):
             elif entry["label"] != node.label:
                 clash = True
         # a key is the same key whatever the style of the comment it is in, as for the
-        # lookup of a support: NHX "B=40" and BEAST "B=40" are one value
-        earlier = {comment_key(text): text.partition("=")[2].strip()
-                   for _, text in entry["items"]} if entry["merged"] else {}
+        # lookup of a support: NHX "B=40" and BEAST "B=40" are one value.
+        # Only the branches merged before this one are compared: items of this branch
+        # are all kept, in order, even when they repeat a key among themselves.
+        earlier = {}
+        for _, text in entry["items"]:
+            earlier.setdefault(comment_key(text), text.partition("=")[2].strip())
         for style, text in items:
             key = comment_key(text)
             if key not in earlier:
                 entry["items"].append((style, text))
-                if entry["merged"]:
-                    earlier[key] = text.partition("=")[2].strip()
             elif earlier[key] != text.partition("=")[2].strip():
                 clash = True
         entry["texts"].extend(text for text in texts if text not in entry["texts"])

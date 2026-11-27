@@ -576,3 +576,82 @@ class TestSameKeyInBothStyles:
         result = run("root", "-n", "E", "-i", str(path))
         assert result.stderr == ""
         assert "[&posterior=0.9][&&NHX:S=human:B=40]" in result.stdout
+
+
+# ---------------------------------------------------------------- 8. merging the two old-root branches, every combination
+
+def merged_items(run, write, first, second):
+    """Unroot [&R] ((A,B)<first>:1,(C,D)<second>:2) and return (output, stderr, items of the merged branch)."""
+    path = write("merge.tre", "[&R] ((A:1,B:1)%s:1,(C:1,D:1)%s:2);\n" % (first, second))
+    result = run("root", "--unroot", "-i", str(path))
+    assert result.returncode == 0, result.stderr
+    tree = read(result.stdout.strip())[0]
+    node = next(n for n in tree.postorder_internal_node_iter() if n is not tree.seed_node)
+    items = [item for comment in node.comments for item in (treekit.split_comment(comment) or [])]
+    return result.stdout, result.stderr, items
+
+
+class TestMergeCombinations:
+
+    CLASH = "different labels or annotations on the two branches at the old root"
+
+    def test_the_review_case_two_values_of_one_key_on_the_second_branch_only(self, run, write):
+        # the first branch has no B, so nothing can conflict: both B items stay, in order
+        out, err, items = merged_items(run, write, "[&posterior=0.9]", "[&&NHX:B=40][&B=99]")
+        assert err == ""
+        assert items == ["posterior=0.9", "B=40", "B=99"]
+        assert "[&posterior=0.9][&&NHX:B=40][&B=99]" in out
+
+    def test_the_same_with_the_branches_swapped(self, run, write):
+        _, err, items = merged_items(run, write, "[&&NHX:B=40][&B=99]", "[&posterior=0.9]")
+        assert err == ""
+        assert items == ["B=40", "B=99", "posterior=0.9"]
+
+    def test_repeats_on_the_first_branch_only(self, run, write):
+        _, err, items = merged_items(run, write, "[&B=40][&B=99]", "[&posterior=0.9]")
+        assert err == ""
+        assert items == ["B=40", "B=99", "posterior=0.9"]
+
+    def test_repeats_on_both_branches_with_other_keys(self, run, write):
+        _, err, items = merged_items(run, write, "[&B=40][&B=99]", "[&C=1][&C=2]")
+        assert err == ""
+        assert items == ["B=40", "B=99", "C=1", "C=2"]
+
+    def test_a_key_on_both_branches_keeps_the_first_value_and_warns(self, run, write):
+        _, err, items = merged_items(run, write, "[&B=40]", "[&B=99][&B=7]")
+        assert self.CLASH in err
+        assert items == ["B=40"]            # the first branch's value; the second's are dropped
+
+    def test_the_first_branch_repeats_and_the_second_agrees_with_one_of_them(self, run, write):
+        # the second branch has B=40, equal to the first value of the first: no conflict
+        _, err, items = merged_items(run, write, "[&B=40][&B=99]", "[&B=40]")
+        assert err == ""
+        assert items == ["B=40", "B=99"]
+
+    def test_the_second_branch_disagrees_with_the_first_value(self, run, write):
+        _, err, items = merged_items(run, write, "[&B=40][&B=99]", "[&B=99]")
+        assert self.CLASH in err          # compared with the first value of the key (40)
+        assert items == ["B=40", "B=99"]
+
+    @pytest.mark.parametrize("first, second", [
+        ("[&B=40]", "[&&NHX:B=40]"), ("[&&NHX:B=40]", "[&B=40]"),
+        ("[&B=40,C=1]", "[&&NHX:C=1:B=40]"),
+    ])
+    def test_the_same_values_in_both_styles_are_no_conflict(self, run, write, first, second):
+        _, err, items = merged_items(run, write, first, second)
+        assert err == ""
+        assert sorted(items) == sorted(set(items))
+
+    def test_labels_and_items_together(self, run, write):
+        _, err, items = merged_items(run, write, "90", "[&B=40][&B=99]")
+        assert err == ""
+        assert items == ["B=40", "B=99"]
+
+    def test_collapse_reads_the_same_support_after_the_merge(self, run, write, tmp_path):
+        path = write("m.tre", "[&R] ((A:1,B:1)[&posterior=0.9]:1,(C:1,D:1)[&&NHX:B=40][&B=99]:2);\n")
+        merged = tmp_path / "merged.tre"
+        run("root", "--unroot", "-o", str(merged), "-i", str(path))
+        result = run("collapse", "-m", "50", "--support-key", "B", "-i", str(merged))
+        assert result.returncode == 0, result.stderr
+        # the first B (40) is the support: below 50, collapsed, and nothing is left to read
+        assert "B=" not in result.stdout

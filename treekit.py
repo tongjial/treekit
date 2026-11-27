@@ -1738,13 +1738,17 @@ def keep_split_labels(tree, operation, conflicts=None, dropped=None):
                 entry["label"] = node.label
             elif entry["label"] != node.label:
                 clash = True
-        earlier = {(style, comment_key(text)): text for style, text in entry["items"]} \
-            if entry["merged"] else {}
+        # a key is the same key whatever the style of the comment it is in, as for the
+        # lookup of a support: NHX "B=40" and BEAST "B=40" are one value
+        earlier = {comment_key(text): text.partition("=")[2].strip()
+                   for _, text in entry["items"]} if entry["merged"] else {}
         for style, text in items:
-            key = (style, comment_key(text))
+            key = comment_key(text)
             if key not in earlier:
                 entry["items"].append((style, text))
-            elif earlier[key] != text:
+                if entry["merged"]:
+                    earlier[key] = text.partition("=")[2].strip()
+            elif earlier[key] != text.partition("=")[2].strip():
                 clash = True
         entry["texts"].extend(text for text in texts if text not in entry["texts"])
         entry["merged"] = True
@@ -2129,12 +2133,18 @@ def comment_style(comment):
 
 def join_items(items):
 
-    # comments for (style, text) items: one per style, in the order the styles appear
+    # comments for (style, text) items, in the order of the items: a new comment starts
+    # where the style changes, so that the first item for a key stays the first one
+    # (collapse reads the first value of a key, whatever the style)
     comments = []
-    for style in dict.fromkeys(style for style, _ in items):
-        texts = [text for kind, text in items if kind == style]
-        comments.append(NHX_PREFIX + ":".join(texts) if style == "nhx"
-                        else "&" + ",".join(texts))
+    run, style = [], None
+    for kind, text in items + [(None, None)]:
+        if kind != style and run:
+            comments.append(NHX_PREFIX + ":".join(run) if style == "nhx" else "&" + ",".join(run))
+            run = []
+        style = kind
+        if text is not None:
+            run.append(text)
     return comments
 
 def split_comment(comment):

@@ -487,6 +487,92 @@ class TestNhxComments:
         assert treekit.split_comment("&&NHX:S=human:B=40") == ["S=human", "B=40"]
         assert treekit.comment_style("&&NHX:B=1") == "nhx" and treekit.comment_style("&B=1") == "beast"
         assert treekit.comment_value(["&&NHX:S=human:B=40"], "B") == "40"
-        assert treekit.join_items([("nhx", "B=40"), ("beast", "p=1"), ("nhx", "S=x"), ("beast", "q=2")]) == \
+        # items stay in their order; a comment ends where the style changes
+        assert treekit.join_items([("nhx", "B=40"), ("nhx", "S=x"), ("beast", "p=1"), ("beast", "q=2")]) == \
             ["&&NHX:B=40:S=x", "&p=1,q=2"]
+        assert treekit.join_items([("nhx", "B=40"), ("beast", "p=1"), ("nhx", "S=x")]) == \
+            ["&&NHX:B=40", "&p=1", "&&NHX:S=x"]
         assert treekit.join_items([]) == []
+
+
+# ---------------------------------------------------------------- 7. one key, two comment styles
+
+def b_values(text):
+    """The values of every item with the key B, in the order they are written."""
+    tree = read(text.strip())[0]
+    values = []
+    for node in tree.preorder_node_iter():
+        for comment in node.comments:
+            for item in treekit.split_comment(comment) or []:
+                if treekit.comment_key(item) == "B":
+                    values.append(item.partition("=")[2])
+    return values
+
+
+class TestSameKeyInBothStyles:
+
+    MIX = "((A:1,B:1)[&S=mouse][&&NHX:B=99][&B=40]:1,(C:1,D:1):1,E:1);\n"
+
+    @pytest.mark.parametrize("outgroup", ["C", "E", "A"])
+    def test_rerooting_keeps_the_order_of_the_items(self, run, write, outgroup):
+        path = write("m.tre", self.MIX)
+        result = run("root", "-n", outgroup, "-i", str(path))
+        assert result.returncode == 0, result.stderr
+        assert b_values(result.stdout) == ["99", "40"]
+        assert "[&S=mouse][&&NHX:B=99][&B=40]" in result.stdout      # as written
+
+    def test_collapse_gives_the_same_answer_before_and_after_rerooting(self, run, write, tmp_path):
+        path = write("m.tre", self.MIX)
+        rooted = tmp_path / "rooted.tre"
+        run("root", "-n", "C", "-o", str(rooted), "-i", str(path))
+        before = run("collapse", "-m", "95", "--support-key", "B", "-i", str(path))
+        after = run("collapse", "-m", "95", "--support-key", "B", "-i", str(rooted))
+        # the first value of the key (99) is the support: the branch is kept in both
+        assert before.returncode == after.returncode == 0, (before.stderr, after.stderr)
+        assert before.stderr == "" == after.stderr
+        assert b_values(before.stdout) == b_values(after.stdout) == ["99", "40"]
+
+    def test_collapse_does_remove_the_branch_when_the_first_value_is_low(self, run, write, tmp_path):
+        # the same tree with the order of the two B items swapped: now 40 is the support
+        path = write("m.tre", self.MIX.replace("[&&NHX:B=99][&B=40]", "[&B=40][&&NHX:B=99]"))
+        rooted = tmp_path / "rooted.tre"
+        run("root", "-n", "C", "-o", str(rooted), "-i", str(path))
+        for source in (path, rooted):
+            result = run("collapse", "-m", "95", "--support-key", "B", "-i", str(source))
+            assert b_values(result.stdout) == [], source             # collapsed, both times
+
+    CLASH = "[&R] (((A:1,B:1):1,C:2)[&&NHX:B=40]:1,(D:1,E:1)[&B=99]:1);\n"
+
+    def test_different_values_on_the_two_old_root_branches_are_reported(self, run, write):
+        path = write("c.tre", self.CLASH)
+        result = run("root", "--unroot", "-i", str(path))
+        assert result.returncode == 0, result.stderr
+        assert "different labels or annotations on the two branches at the old root" in result.stderr
+        assert b_values(result.stdout) == ["40"]                   # the first value, in its own style
+        assert "[&&NHX:B=40]" in result.stdout
+
+    def test_the_same_value_in_both_styles_is_no_conflict(self, run, write):
+        path = write("c.tre", self.CLASH.replace("B=99", "B=40"))
+        result = run("root", "--unroot", "-i", str(path))
+        assert result.stderr == ""
+        assert b_values(result.stdout) == ["40"]
+
+    def test_rooting_on_an_outgroup_reports_it_too(self, run, write):
+        path = write("c.tre", self.CLASH)
+        result = run("root", "-n", "A", "-i", str(path))
+        assert "different labels or annotations" in result.stderr
+        assert b_values(result.stdout) == ["40"]
+
+    def test_the_value_that_collapse_reads_is_the_one_that_was_kept(self, run, write, tmp_path):
+        path = write("c.tre", self.CLASH)
+        unrooted = tmp_path / "u.tre"
+        run("root", "--unroot", "-o", str(unrooted), "-i", str(path))
+        result = run("collapse", "-m", "50", "--support-key", "B", "-i", str(unrooted))
+        # B=40 is below 50: the merged branch is collapsed, and no 99 is left to read
+        assert "B=99" not in result.stdout and "B=40" not in result.stdout
+
+    def test_different_keys_in_the_two_styles_are_both_kept_in_order(self, run, write):
+        path = write("t.tre", "((A:1,B:1)[&posterior=0.9][&&NHX:S=human:B=40]:1,(C:1,D:1):1,E:1);\n")
+        result = run("root", "-n", "E", "-i", str(path))
+        assert result.stderr == ""
+        assert "[&posterior=0.9][&&NHX:S=human:B=40]" in result.stdout

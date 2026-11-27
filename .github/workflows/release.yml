@@ -1,0 +1,110 @@
+name: release
+
+# Pushing a tag such as v0.2.0 builds the single-file executables on every platform, runs the
+# test suite against them, and publishes them in a GitHub release. The same builds and tests
+# run, without publishing, for pull requests that touch the packaging, and on demand.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "packaging/**"
+      - "treekit.py"
+      - "pyproject.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+  # a Python from uv, not the one of the runner: the executable then needs only an old glibc
+  UV_PYTHON_PREFERENCE: only-managed
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # one failing platform must not hide the result of the others
+      fail-fast: false
+      matrix:
+        include:
+          - {name: linux-x86_64, os: ubuntu-24.04, exe: treekit}
+          - {name: windows-x86_64, os: windows-2025, exe: treekit.exe}
+          - {name: macos-arm64, os: macos-15, exe: treekit}
+          - {name: macos-x86_64, os: macos-15-intel, exe: treekit}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+
+      - name: The tag must match the version in treekit.py
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' treekit.py)
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match __version__ = $version in treekit.py"
+            exit 1
+          fi
+
+      - name: Build the executable and the archive
+        run: >
+          uv run --no-project --python "$PYTHON_VERSION"
+          --with-requirements packaging/requirements-build.txt
+          packaging/build.py
+
+      - name: Run the test suite against the executable
+        env:
+          TREEKIT_BIN: ${{ github.workspace }}/dist/${{ matrix.exe }}
+        run: >
+          uv run --no-project --python "$PYTHON_VERSION"
+          --with-requirements packaging/requirements-build.txt --with pytest
+          pytest -q -p no:cacheprovider
+
+      - name: Check the archive as a user would use it
+        run: uv run --no-project --python "$PYTHON_VERSION" python packaging/check_archive.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.name }}
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  # all platforms or none: runs only when every build above passed
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release
+
+      - name: Collect and verify the checksums
+        working-directory: release
+        run: |
+          cat *.sha256 > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          ls -l
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=()
+          # v1.0.0-rc1 and the like are marked as pre-releases
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then flags+=(--prerelease); fi
+          gh release create "$GITHUB_REF_NAME" release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "treekit ${GITHUB_REF_NAME#v}" \
+            --generate-notes \
+            "${flags[@]}"
